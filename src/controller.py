@@ -1,11 +1,17 @@
 # controller.py
-
-from sensors import SoilSensor, LevelSensor, FlowSensor
-from actuators import PumpControl, ValveControl
-from signal_conditioning import SignalConditioning
-from decision_engine import DecisionEngine
-from cloud_sync import CloudSync
-from gui import NodeRedInterface
+# -------------------------------------------------------------------------------
+# Controlador principal del sistema de riego inteligente.
+# Integra:
+#   - 7 válvulas (desague_1, desague_2, mora, lechuga, aguaymanto, mango, suministro_pucp)
+#   - 1 bomba DC
+#   - 4 sensores de suelo 7en1 (mora, mango, aguaymanto, lechuga)
+#   - 1 sensor de flujo
+#   - 1 sensor de nivel (ultrasónico)
+#   - Modo automático vs manual sugerido
+#   - Cronograma de riego (L, M, X) y domingos especiales
+#   - Limpieza de datos (3 meses automático, 6 meses manual), CSVs
+#   - Chequeo de coherencia
+# -------------------------------------------------------------------------------
 
 import time
 import logging
@@ -15,219 +21,372 @@ import csv
 import sys
 import requests
 from datetime import datetime, timedelta
-import schedule  # Para programar tareas
-import shutil    # Para obtener información del sistema de archivos
+import schedule
+import shutil
+import gzip
 import pandas as pd
 
-# Configuración del logging para registrar eventos y errores
+# Módulos del proyecto
+from sensors import SoilSensor7en1, LevelSensor, FlowSensor
+from actuators import PumpControl, ValveControl
+from signal_conditioning import SignalConditioning
+from decision_engine import DecisionEngine
+from cloud_sync import CloudSync
+from gui import NodeRedInterface
+
+from typing import Dict, Any, Optional, List
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
 
 class ControladorSistemaRiego:
     """
-    Clase principal que controla el sistema de riego automatizado.
+    Clase principal que coordina la lógica de riego:
+     - 7 electroválvulas (desague_1, desague_2, mora, lechuga, aguaymanto, mango, suministro_pucp)
+     - Bomba DC
+     - 4 sensores 7en1 (mora, mango, aguaymanto, lechuga)
+     - Sensor de flujo y sensor de nivel
+     - Cronograma de riego programado (lunes, martes, miércoles)
+     - Días especiales (fertilizante o entrenamiento) los domingos
+     - Modo automático vs. manual
+     - Limpieza de datos local (CSV)
+     - Chequeo de coherencia en las decisiones
     """
 
-    def __init__(self):
-        # Inicialización de sensores
-        self.soil_sensor = SoilSensor(address=1)
+    def __init__(self) -> None:
+        # ----------------------------------------------------------------------
+        # 1) Inicializar Sensores
+        # ----------------------------------------------------------------------
+        self.soil_sensor_mora       = SoilSensor7en1(address=1)
+        self.soil_sensor_mango      = SoilSensor7en1(address=2)
+        self.soil_sensor_aguaymanto = SoilSensor7en1(address=3)
+        self.soil_sensor_lechuga    = SoilSensor7en1(address=4)
 
-        # Sensor de nivel de agua (Ultrasonido US-100)
         self.level_sensor = LevelSensor(
-            trig_pin=18,  # GPIO18 para TRIG
-            echo_pin=24,  # GPIO24 para ECHO
+            trig_pin=18,
+            echo_pin=24,
+            calibration_params={'tank_height': 200}
+        )
+        self.flow_sensor = FlowSensor(
+            gpio_pin=17,
             calibration_params={
-                'tank_height': 200  # Altura del tanque en cm
+                'factor': 5.5,
+                'tolerance': 0.2,
+                'minimal_flow_threshold': 0.5
             }
         )
 
-        # Inicializar sensor de flujo
-        self.flow_sensor = FlowSensor(gpio_pin=17, calibration_params={
-            'factor': 5.5,                    # Factor de calibración específico del sensor
-            'tolerance': 0.2,                 # Tolerancia aceptable en el caudal (20%)
-            'minimal_flow_threshold': 0.5     # Umbral mínimo para considerar flujo significativo
-        })
-
-        # Acondicionamiento de señal
+        # ----------------------------------------------------------------------
+        # 2) Acondicionamiento de señal (filtros, etc.)
+        # ----------------------------------------------------------------------
         self.signal_conditioning = SignalConditioning()
 
-        # Motor de toma de decisiones (modelo de Machine Learning)
+        # ----------------------------------------------------------------------
+        # 3) Motor de decisiones (Machine Learning + Reglas de umbrales)
+        # ----------------------------------------------------------------------
         self.decision_engine = DecisionEngine(model_path='data/modelo_actualizado.pkl')
 
-        # Sincronización con la nube
+        # ----------------------------------------------------------------------
+        # 4) Sincronización con la nube (cloud_sync)
+        # ----------------------------------------------------------------------
         self.cloud_sync = CloudSync(credentials_path='config/credentials.json')
 
-        # Interfaz gráfica (GUI) en Node-RED
+        # ----------------------------------------------------------------------
+        # 5) Interfaz Node-RED o GUI
+        # ----------------------------------------------------------------------
         self.gui = NodeRedInterface()
 
-        # Parámetros del sistema
-        self.data_collection_frequency = 60  # Frecuencia de recolección de datos en segundos
-        self.sensor_data = []
-
-        # Estado del sistema
+        # ----------------------------------------------------------------------
+        # 6) Parámetros y estado global
+        # ----------------------------------------------------------------------
+        self.data_collection_frequency = 60  # seg (leer cada 1 min)
+        self.sensor_data: List[Dict[str, Any]] = []
         self.online_mode = False
-        self.control_mode = 'automatic'
-        self.is_busy = False  # Indica si el sistema está en una acción crítica
+        self.control_mode = 'automatic'   # 'manual' es la otra opción
+        self.is_busy = False              # Evita acciones simultáneas en _ejecutar_decision()
+        self.last_manual_interaction = datetime.now()  # Forzar 'auto' si 2 días sin respuesta
 
-        # Definir pines GPIO para los actuadores
+        # ----------------------------------------------------------------------
+        # 7) Definir pines GPIO para bomba + 7 válvulas (ajustar a tu hardware)
+        # ----------------------------------------------------------------------
         GPIO_PINS = {
-            'bomba': 25,
-            'valvula_riego': 23,
-            'valvula_suministro': 24,
-            'valvula_fertilizante': 22
+            'bomba_dc':        25,
+            'desague_1':       5,
+            'desague_2':       6,
+            'mora':            13,
+            'lechuga':         19,
+            'aguaymanto':      26,
+            'mango':           16,
+            'suministro_pucp': 20
         }
 
-        # Inicialización de actuadores
-        self.pump_control = PumpControl(GPIO_PINS['bomba'])
+        # ----------------------------------------------------------------------
+        # 8) Inicializar actuadores
+        # ----------------------------------------------------------------------
+        self.pump_control = PumpControl(GPIO_PINS['bomba_dc'])
         self.valve_control = ValveControl({
-            'valvula_riego': GPIO_PINS['valvula_riego'],
-            'valvula_suministro': GPIO_PINS['valvula_suministro'],
-            'valvula_fertilizante': GPIO_PINS['valvula_fertilizante']
+            'desague_1':       GPIO_PINS['desague_1'],
+            'desague_2':       GPIO_PINS['desague_2'],
+            'mora':            GPIO_PINS['mora'],
+            'lechuga':         GPIO_PINS['lechuga'],
+            'aguaymanto':      GPIO_PINS['aguaymanto'],
+            'mango':           GPIO_PINS['mango'],
+            'suministro_pucp': GPIO_PINS['suministro_pucp']
         })
 
-        # Estados de los actuadores
-        self.actuator_states = {
-            'bomba': False,
-            'valvula_riego': False,
-            'valvula_suministro': False,
-            'valvula_fertilizante': False
-        }
+        # ----------------------------------------------------------------------
+        # 9) Variables de riego/fertilizante y cronograma
+        # ----------------------------------------------------------------------
+        self.bomba_activada_hoy = False
+        self.ultimo_dia_bomba: Optional[datetime.date] = None
 
-        # Variables para programación de riego
-        self.irrigation_schedule = []
         self.total_daily_water = 0
         self.remaining_daily_water = 0
-        self.daily_fertilizer_percentage = 0  # Porcentaje de fertilizante diario
+        self.daily_fertilizer_percentage = 0
 
-        # Programar horarios de riego iniciales
-        self._programar_riego_diario()
+        # Programar riego lunes, martes, miércoles:
+        self._programar_riego_programado()
+        # Programar domingo especial:
+        self._programar_domingo_especial()
 
-        # Programar sincronización semanal con la nube en horario nocturno
-        schedule.every().week.do(self._programar_sincronizacion_semanal)
-
-        # Modo de simulación
-        self.simulation_mode = sys.platform == "win32"
-
-        # Implementación de lock para seguridad de hilos
+        # ----------------------------------------------------------------------
+        # 10) Lock de hilos
+        # ----------------------------------------------------------------------
         self.lock = threading.Lock()
 
-        logging.info("Controlador del Sistema de Riego inicializado.")
+        # Si se corre en Windows, modo simulado
+        self.simulation_mode = (sys.platform == "win32")
 
-    def iniciar(self):
+        logging.info("ControladorSistemaRiego inicializado con éxito.")
+
+    # =========================================================================
+    # LOOP PRINCIPAL
+    # =========================================================================
+    def iniciar(self) -> None:
         """
-        Método principal que inicia el ciclo de control del sistema de riego.
+        Bucle principal con schedule + lecturas periódicas.
         """
-        logging.info("Iniciando el sistema de riego...")
+        logging.info("Iniciando loop principal del controlador de riego...")
+
         while True:
             try:
-                # Ejecutar tareas programadas
+                # 1) Verificar si se cambia de día para resetear la bomba
+                self._verificar_reset_bomba_diaria()
+
+                # 2) Verificar si el modo manual lleva mucho tiempo inactivo
+                self._verificar_time_out_manual()
+
+                # 3) Ejecutar las tareas programadas
                 schedule.run_pending()
 
-                # 1. Adquisición de datos de sensores
-                sensor_values = self._leer_sensores()
+                # 4) Ciclo de lectura y procesamiento
+                self._ciclo_lectura_y_procesamiento()
 
-                # 2. Verificar conexión a internet
-                self.online_mode = self._verificar_conexion_internet()
-
-                # 3. Procesar los datos con la lógica de toma de decisiones
-                decision = self._tomar_decision(sensor_values)
-
-                # 4. Accionar los actuadores según la decisión
-                # No accionamos actuadores aquí si es riego programado
-                if decision:
-                    self._accionar_actuadores(decision)
-
-                # 5. Detectar anomalías en el flujo de agua
-                self._verificar_anomalias(sensor_values)
-
-                # 6. Actualizar la interfaz gráfica con los nuevos datos y estado del sistema
-                self.gui.actualizar_interfaz(sensor_values, self.control_mode, decision)
-
-                # 7. Monitorear la capacidad de almacenamiento y eliminar datos antiguos si es necesario
-                self._monitorear_almacenamiento()
-
-                # 8. Esperar hasta la próxima iteración
                 time.sleep(self.data_collection_frequency)
 
             except KeyboardInterrupt:
-                logging.info("Interrupción manual del sistema.")
+                logging.info("Interrupción manual (Ctrl + C). Saliendo...")
                 break
             except Exception:
-                logging.exception("Error en el ciclo principal.")
+                logging.exception("Error en el loop principal:")
                 time.sleep(5)
 
-    def _leer_sensores(self):
+    def _verificar_reset_bomba_diaria(self) -> None:
         """
-        Adquiere los datos de todos los sensores, los acondiciona y guarda en un CSV.
+        Resetea el flag de bomba_activada_hoy si es un nuevo día.
         """
-        logging.info("Leyendo datos de sensores...")
+        hoy = datetime.now().date()
+        if self.ultimo_dia_bomba is None or hoy != self.ultimo_dia_bomba:
+            self.bomba_activada_hoy = False
+            self.ultimo_dia_bomba = hoy
+
+    def _ciclo_lectura_y_procesamiento(self) -> None:
+        """
+        Tareas recurrentes en cada ciclo:
+          - Leer sensores
+          - Manejar nivel de tanque
+          - Riego no programado
+          - Actualizar GUI
+          - Monitorear almacenamiento
+          - En modo manual => recibir comandos
+        """
+        sensor_values = self._leer_sensores_global()
+        self.online_mode = self._verificar_conexion_internet()
+        self._control_nivel_tanque(sensor_values)
+
+        # Riego no programado (jueves=3, viernes=4, sábado=5)
+        self._manejar_riego_no_programado(sensor_values)
+
+        # Manejo modo manual
+        if self.control_mode == 'manual':
+            comandos = self.gui.recibir_comandos()
+            # Procesar comandos
+            if comandos.get('activar_bomba'):
+                self.pump_control.activar()
+            if comandos.get('abrir_valvula_mora'):
+                self.valve_control.abrir_valvula('mora')
+            if comandos.get('cerrar_valvula_mora'):
+                self.valve_control.cerrar_valvula('mora')
+            # Otros comandos análogos...
+
+            # Registrar acción manual en CSV
+            accion_manual = {'accion_manual': True}
+            if comandos.get('activar_bomba'):
+                accion_manual['activar_bomba'] = True
+            if comandos.get('abrir_valvula_mora'):
+                accion_manual['abrir_valvula_mora'] = True
+            if comandos.get('cerrar_valvula_mora'):
+                accion_manual['cerrar_valvula_mora'] = True
+
+            if len(accion_manual) > 1:  # al menos una acción
+                self._guardar_decision_csv(accion_manual)
+            self.last_manual_interaction = datetime.now()
+
+        # Detectar fallos de flujo
+        pump_on = self.pump_control.estado_actual()
+        any_valve_open = any(self.valve_control.estado_actual(v) for v in self.valve_control.valvulas)
+        expected_flow = 5 if (pump_on and any_valve_open) else 0
+        fallo = self.flow_sensor.detectar_fallo(expected_flow=expected_flow)
+
+        if fallo:
+            if self.control_mode == 'automatic':
+                self.pump_control.desactivar()
+                logging.error("Fuga/obstrucción detectada en modo automático. Bomba desactivada.")
+            else:
+                logging.warning("Posible obstrucción/fuga. Avisar al usuario en modo manual.")
+
+        # Actualizar interfaz
+        self.gui.actualizar_interfaz(sensor_values, self.control_mode, {})
+        # Limpieza de datos antiguos si hace falta
+        self._monitorear_almacenamiento()
+
+    def _verificar_time_out_manual(self) -> None:
+        """
+        Si en modo manual no hay interacción en 2 días => pasar a automático.
+        """
+        if self.control_mode == 'manual':
+            dias_sin = (datetime.now() - self.last_manual_interaction).days
+            if dias_sin >= 2:
+                with self.lock:
+                    if not self.is_busy:
+                        self.control_mode = 'automatic'
+                        logging.warning("Forzando modo automático por 2 días sin respuesta en manual.")
+
+    # =========================================================================
+    # LECTURA DE SENSORES
+    # =========================================================================
+    def _leer_sensores_global(self) -> Dict[str, Any]:
+        """
+        Lee 4 sensores 7en1 + nivel + flujo.
+        Retorna un dict con:
+          'humedad_avg', 'temp_avg', 'ce', 'ph', 'N', 'P', 'K',
+          'water_level', 'flow_rate', 'season', 'modo_control', ...
+        """
         try:
-            # Obtener el estado actual de la bomba y la válvula de riego
-            with self.lock:
-                bomba_activa = self.actuator_states.get('bomba', False)
-                valvula_riego_abierta = self.actuator_states.get('valvula_riego', False)
+            mora_data  = self.soil_sensor_mora.leer() or {}
+            mango_data = self.soil_sensor_mango.leer() or {}
+            agm_data   = self.soil_sensor_aguaymanto.leer() or {}
+            lech_data  = self.soil_sensor_lechuga.leer()  or {}
 
-            # Lectura del sensor de suelo
-            soil_values = self.soil_sensor.leer()
-            if soil_values is None:
-                raise ValueError("Error al leer el sensor de suelo")
+            # Promediar humedad, temp, ce, ph, N, P, K
+            humidity_avg = (
+                mora_data.get('humidity', 50) +
+                mango_data.get('humidity', 50) +
+                agm_data.get('humidity', 50)  +
+                lech_data.get('humidity', 50)
+            ) / 4.0
+            temp_avg = (
+                mora_data.get('temperature', 20) +
+                mango_data.get('temperature', 20) +
+                agm_data.get('temperature', 20)  +
+                lech_data.get('temperature', 20)
+            ) / 4.0
+            ce_avg = (
+                mora_data.get('ce', 2.0) +
+                mango_data.get('ce', 2.0) +
+                agm_data.get('ce', 2.0) +
+                lech_data.get('ce', 2.0)
+            ) / 4.0
+            ph_avg = (
+                mora_data.get('ph', 6.5) +
+                mango_data.get('ph', 6.5) +
+                agm_data.get('ph', 6.5) +
+                lech_data.get('ph', 6.5)
+            ) / 4.0
+            n_avg = (
+                mora_data.get('N', 15.0) +
+                mango_data.get('N', 15.0) +
+                agm_data.get('N', 15.0) +
+                lech_data.get('N', 15.0)
+            ) / 4.0
+            p_avg = (
+                mora_data.get('P', 15.0) +
+                mango_data.get('P', 15.0) +
+                agm_data.get('P', 15.0) +
+                lech_data.get('P', 15.0)
+            ) / 4.0
+            k_avg = (
+                mora_data.get('K', 15.0) +
+                mango_data.get('K', 15.0) +
+                agm_data.get('K', 15.0) +
+                lech_data.get('K', 15.0)
+            ) / 4.0
 
-            humidity = soil_values['humidity']
-            temperature = soil_values['temperature']
-            ce = soil_values['ce']
-            ph = soil_values['ph']
+            # Acondicionar humedad y temperatura
+            humidity = self.signal_conditioning.acondicionar_humedad(humidity_avg)
+            temperature = self.signal_conditioning.acondicionar_temperatura(temp_avg)
 
-            # Leer el nivel de agua, pasando el estado de la bomba
-            water_level = self.level_sensor.leer(bomba_activa=bomba_activa)
-
-            # Leer el caudal, pasando los estados de los actuadores
-            flow_rate = self.flow_sensor.leer(bomba_activa=bomba_activa, valvula_riego_abierta=valvula_riego_abierta)
-
-            # Acondicionamiento de señal
-            humidity = self.signal_conditioning.acondicionar_humedad(humidity)
-            temperature = self.signal_conditioning.acondicionar_temperatura(temperature)
-            ph = self.signal_conditioning.acondicionar_ph(ph)
-            ce = self.signal_conditioning.acondicionar_ce(ce)
+            # Nivel
+            water_level = self.level_sensor.leer()
             water_level = self.signal_conditioning.acondicionar_nivel(water_level)
-            # flow_rate podría acondicionarse si es necesario
 
-            # Obtener el timestamp actual
-            timestamp = time.time()
+            # Flujo
+            flow = self.flow_sensor.leer(
+                bomba_activa=self.pump_control.estado_actual(),
+                valvula_riego_abierta=True
+            )
 
-            # Obtener la estación actual
-            season = self._get_current_season()
-
-            # Agrupar datos en un diccionario
+            # Armar dict final
+            now_str = datetime.now().isoformat()
             sensor_values = {
-                'timestamp': timestamp,
-                'humidity': round(humidity, 1),
-                'temperature': round(temperature, 1),
-                'ph': round(ph, 1),
-                'ce': round(ce, 1),
-                'water_level': round(water_level, 1),
-                'flow_rate': round(flow_rate, 1),
-                'season': season
+                'timestamp':   now_str,
+                'humedad_avg': round(humidity, 2),
+                'temp_avg':    round(temperature, 2),
+                'ce':          round(ce_avg, 2),
+                'ph':          round(ph_avg, 2),
+                'N':           round(n_avg, 2),
+                'P':           round(p_avg, 2),
+                'K':           round(k_avg, 2),
+                'water_level': round(water_level, 2) if water_level else None,
+                'flow_rate':   round(flow, 2) if flow else 0.0,
+                'season':      self._get_current_season(),
+                'modo_control': self.control_mode
             }
 
-            logging.info(f"Datos adquiridos: {sensor_values}")
-
-            # Almacenar datos localmente
-            self.sensor_data.append(sensor_values)
-
-            # Guardar los datos en los archivos CSV
-            self._guardar_datos_csv(sensor_values)
-
+            self._guardar_sensores_csv(sensor_values)
             return sensor_values
 
         except Exception:
-            logging.exception("Error al leer sensores:")
-            raise
+            logging.exception("Error en _leer_sensores_global:")
+            return {}
 
+    def _guardar_sensores_csv(self, data: Dict[str, Any]) -> None:
+        csv_path = 'data/sensor_data.csv'
+        file_exists = os.path.isfile(csv_path)
+        campos = [
+            'timestamp','humedad_avg','temp_avg','ce','ph','N','P','K',
+            'water_level','flow_rate','season','modo_control'
+        ]
+        try:
+            with open(csv_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=campos)
+                if not file_exists:
+                    writer.writeheader()
+                writer.writerow(data)
+        except Exception:
+            logging.exception("Error al guardar sensor_data.csv:")
 
-    def _get_current_season(self):
-        """
-        Devuelve la estación actual en Perú.
-        """
+    def _get_current_season(self) -> str:
         month = datetime.now().month
         if month in [12, 1, 2]:
             return 'summer'
@@ -237,547 +396,502 @@ class ControladorSistemaRiego:
             return 'winter'
         elif month in [9, 10, 11]:
             return 'spring'
+        return 'unknown'
+
+    # =========================================================================
+    # CONTROL DE NIVEL DE TANQUE
+    # =========================================================================
+    def _control_nivel_tanque(self, sensor_values: Dict[str, Any]) -> None:
+        lvl = sensor_values.get('water_level')
+        if lvl is None:
+            logging.error("Sensor de nivel devolvió None. Revisar sensor.")
+            self.gui.enviar_mensaje("El sensor de nivel no está disponible. Revise hardware o conexión.")
+            return
+
+        lo = 30.0
+        hi = 85.0
+        if self.control_mode == 'manual':
+            self._control_nivel_tanque_manual(lvl, lo, hi)
         else:
-            return 'unknown'
+            self._control_nivel_tanque_automatico(lvl, lo, hi)
 
-    def _verificar_anomalias(self, sensor_values):
-        """
-        Verifica si hay anomalías en el flujo de agua, indicando posibles fugas o bloqueos.
-        """
-        try:
-            # Determinar si se espera flujo de agua basado en el estado de la bomba y válvulas
-            with self.lock:
-                bomba_activa = self.actuator_states.get('bomba', False)
-                valvula_riego_abierta = self.actuator_states.get('valvula_riego', False)
-
-            if bomba_activa and valvula_riego_abierta:
-                # Si la bomba y la válvula están activas, se espera un flujo normal
-                expected_flow = self.flow_sensor.calibration_params.get('expected_flow', 30)  # Valor promedio esperado
+    def _control_nivel_tanque_automatico(self, level: float, lo: float, hi: float) -> None:
+        with self.lock:
+            if level < lo:
+                self.valve_control.cerrar_valvula('desague_1')
+                self.valve_control.cerrar_valvula('desague_2')
+                self.valve_control.abrir_valvula('suministro_pucp')
+            elif level > hi:
+                for valv in ['mora','lechuga','aguaymanto','mango']:
+                    self.valve_control.cerrar_valvula(valv)
+                self.valve_control.abrir_valvula('desague_1')
+                self.valve_control.abrir_valvula('desague_2')
+                self.valve_control.cerrar_valvula('suministro_pucp')
             else:
-                # Si la bomba o la válvula están cerradas, no debería haber flujo
-                expected_flow = 0  # No debería haber flujo
+                self.valve_control.cerrar_valvula('desague_1')
+                self.valve_control.cerrar_valvula('desague_2')
+                self.valve_control.cerrar_valvula('suministro_pucp')
 
-            # Obtener el flujo real desde sensor_values
-            actual_flow = sensor_values.get('flow_rate', 0)
-            # Actualizar last_reading del flow_sensor
-            with self.flow_sensor.lock:
-                self.flow_sensor.last_reading = actual_flow
+    def _control_nivel_tanque_manual(self, level: float, lo: float, hi: float) -> None:
+        if level < lo:
+            logging.info("Modo Manual: Sugerir abrir 'suministro_pucp' (nivel bajo).")
+        elif level > hi:
+            logging.info("Modo Manual: Sugerir abrir desagües 1 y 2 (nivel alto).")
+        else:
+            logging.debug("Nivel dentro de umbral, no sugerir nada en modo manual.")
 
-            # Detectar fallos en el flujo
-            flow_anomaly = self.flow_sensor.detectar_fallo(expected_flow)
-            if flow_anomaly:
-                # Ya se ha registrado el error dentro de detectar_fallo()
-                pass
+    # =========================================================================
+    # RIEGO NO PROGRAMADO (jueves=3, viernes=4, sábado=5)
+    # =========================================================================
+    def _manejar_riego_no_programado(self, sensor_values: Dict[str, Any]) -> None:
+        weekday = datetime.now().weekday()
+        if weekday in [3, 4, 5]:  # jueves, viernes, sábado
+            hum = sensor_values.get('humedad_avg', 50)
+            if hum < 20 or hum > 90:
+                logging.info("Fuera de umbrales (día no programado) => corrección simple.")
+                self._corrigir_fuera_umbrales(sensor_values)
 
-        except Exception:
-            logging.exception("Error al verificar anomalías de flujo:")
-            raise
-
-    def _guardar_datos_csv(self, sensor_values):
+    def _corrigir_fuera_umbrales(self, sensor_values: Dict[str, Any]) -> None:
         """
-        Guarda los datos de sensores en un archivo CSV.
-        """
-        # Ruta del archivo CSV
-        csv_file = 'data/sensor_data.csv'
-        file_exists = os.path.isfile(csv_file)
-
-        # Convertir timestamp a formato legible sin modificar sensor_values
-        timestamp_str = datetime.fromtimestamp(sensor_values['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
-
-        # Crear una copia de sensor_values para escribir al CSV
-        sensor_values_csv = sensor_values.copy()
-        sensor_values_csv['timestamp'] = timestamp_str
-
-        # Campos del CSV
-        campos = ['timestamp', 'humidity', 'temperature', 'ph', 'ce', 'water_level', 'flow_rate', 'season']
-
-        try:
-            # Escribir en el CSV usando sensor_values_csv
-            with open(csv_file, mode='a', newline='') as archivo_csv:
-                escritor = csv.DictWriter(archivo_csv, fieldnames=campos)
-                if not file_exists:
-                    escritor.writeheader()
-                escritor.writerow(sensor_values_csv)
-            logging.info("Datos guardados en sensor_data.csv")
-        except Exception:
-            logging.exception("Error al guardar datos en CSV:")
-            raise
-
-    def _verificar_conexion_internet(self):
-        """
-        Verifica la conexión a internet intentando acceder a un servicio conocido.
-        Retorna True si hay conexión, False de lo contrario.
-        """
-        try:
-            requests.get('https://www.google.com', timeout=5)
-            return True
-        except (requests.ConnectionError, requests.Timeout):
-            return False
-
-    def _tomar_decision(self, sensor_values):
-        """
-        Toma decisiones basadas en los datos de los sensores y la lógica definida.
-        """
-        logging.info("Procesando datos y tomando decisiones...")
-        try:
-            # Obtener el modo de control desde la interfaz
-            nuevo_modo_control = self.gui.obtener_modo_control()
-            logging.info(f"Modo de control solicitado: {nuevo_modo_control}")
-
-            # Verificar si se puede cambiar el modo de control
-            with self.lock:
-                if nuevo_modo_control != self.control_mode:
-                    if not self.is_busy:
-                        self.control_mode = nuevo_modo_control
-                        logging.info(f"Modo de control cambiado a: {self.control_mode}")
-                    else:
-                        logging.warning("No se puede cambiar el modo de control durante una acción crítica.")
-
-            if self.control_mode == 'manual':
-                logging.info("Modo manual activo. Recibiendo comandos manuales.")
-                # Recibir comandos manuales desde la interfaz
-                with self.lock:
-                    if not self.is_busy:
-                        decision = self.gui.recibir_comandos()
-                    else:
-                        logging.warning("No se pueden ejecutar comandos manuales durante una acción crítica.")
-                        decision = {}
-            else:
-                # Utilizar el motor de decisiones (Machine Learning) para tomar decisiones
-                decision = self.decision_engine.evaluar(sensor_values)
-
-                # Actualizar la cantidad total de agua y fertilizante para el día
-                with self.lock:
-                    self.total_daily_water = decision.get('cantidad_agua', 0)
-                    self.remaining_daily_water = self.total_daily_water
-
-                    # Actualizar el porcentaje de fertilizante
-                    self.daily_fertilizer_percentage = decision.get('porcentaje_fertilizante', 0)
-
-                # Reprogramar los horarios de riego con la nueva cantidad de agua
-                self._programar_riego_diario()
-
-                # No accionamos actuadores aquí, se hará en los eventos programados
-                decision = {}  # Vaciar decisión para evitar accionar actuadores ahora
-
-            # Guardar la decisión en un archivo CSV
-            self._guardar_decision_csv(sensor_values, decision)
-
-            return decision
-
-        except Exception:
-            logging.exception("Error al tomar decisiones:")
-            raise
-
-    def _accionar_actuadores(self, decision):
-        """
-        Controla los actuadores según la decisión tomada.
-        """
-        try:
-            with self.lock:
-                if self.is_busy:
-                    logging.warning("El sistema está ocupado realizando una acción crítica. No se pueden accionar actuadores ahora.")
-                    return
-
-            # Control de la bomba hidráulica
-            if decision.get('activar_bomba'):
-                self.pump_control.activar()
-                with self.lock:
-                    self.actuator_states['bomba'] = True
-            else:
-                self.pump_control.desactivar()
-                with self.lock:
-                    self.actuator_states['bomba'] = False
-
-            # Control de la válvula de riego
-            if decision.get('abrir_valvula_riego'):
-                self.valve_control.abrir_valvula('valvula_riego')
-                with self.lock:
-                    self.actuator_states['valvula_riego'] = True
-            else:
-                self.valve_control.cerrar_valvula('valvula_riego')
-                with self.lock:
-                    self.actuator_states['valvula_riego'] = False
-
-            # Control del inyector de fertilizante
-            if decision.get('inyectar_fertilizante'):
-                # Ajustar la dosificación según el porcentaje de fertilizante
-                porcentaje = decision.get('porcentaje_fertilizante', 0)
-                self._ajustar_dosificacion_fertilizante(porcentaje)
-            else:
-                self.valve_control.cerrar_valvula('valvula_fertilizante')
-                with self.lock:
-                    self.actuator_states['valvula_fertilizante'] = False
-
-            # Control de la válvula de suministro alternativo
-            if decision.get('abrir_valvula_suministro'):
-                self.valve_control.abrir_valvula('valvula_suministro')
-                with self.lock:
-                    self.actuator_states['valvula_suministro'] = True
-            else:
-                self.valve_control.cerrar_valvula('valvula_suministro')
-                with self.lock:
-                    self.actuator_states['valvula_suministro'] = False
-
-            logging.info(f"Acciones ejecutadas: {decision}")
-
-        except Exception:
-            logging.exception("Error al accionar actuadores:")
-            raise
-
-    def _ajustar_dosificacion_fertilizante(self, porcentaje):
-        """
-        Ajusta la dosificación del fertilizante en función del porcentaje calculado.
-        Controla el tiempo de apertura de la válvula de fertilizante para lograr la dosificación deseada.
-        """
-        try:
-            with self.lock:
-                if self.is_busy:
-                    logging.warning("El sistema está ocupado. No se puede ajustar la dosificación de fertilizante ahora.")
-                    return
-                self.is_busy = True  # Iniciando acción crítica
-
-            # Calcular el tiempo de apertura de la válvula de fertilizante en función del porcentaje
-            # Suponiendo que el porcentaje es entre 0% y 100%
-            # Tiempo máximo de apertura (en segundos) para 100% de fertilizante
-            max_fertilizer_time = 10  # Ajustar según las características del sistema
-
-            # Calcular el tiempo real de apertura
-            tiempo_apertura = (porcentaje / 100) * max_fertilizer_time
-
-            if tiempo_apertura > 0:
-                logging.info(f"Iniciando dosificación de fertilizante por {tiempo_apertura:.2f} segundos.")
-
-                # Abrir válvula de fertilizante
-                self.valve_control.abrir_valvula('valvula_fertilizante')
-                with self.lock:
-                    self.actuator_states['valvula_fertilizante'] = True
-
-                # Esperar el tiempo calculado
-                time.sleep(tiempo_apertura)
-
-                # Cerrar válvula de fertilizante
-                self.valve_control.cerrar_valvula('valvula_fertilizante')
-                with self.lock:
-                    self.actuator_states['valvula_fertilizante'] = False
-
-                logging.info("Dosificación de fertilizante completada.")
-            else:
-                logging.info("Porcentaje de fertilizante es 0%. No se realizará dosificación.")
-
-            with self.lock:
-                self.is_busy = False  # Finalizando acción crítica
-
-        except Exception:
-            logging.exception("Error al ajustar dosificación de fertilizante:")
-            with self.lock:
-                self.is_busy = False
-            raise
-
-    def _programar_riego_diario(self):
-        """
-        Programa los horarios de riego diarios basados en los requerimientos.
-        """
-        # Limpiar programación anterior
-        for job in self.irrigation_schedule:
-            schedule.cancel_job(job)
-        self.irrigation_schedule.clear()
-
-        # Definir horarios y días de riego
-        irrigation_times = ['07:15', '08:15', '09:15']  # Horarios en los que se iniciará el riego
-        irrigation_days = ['Monday', 'Tuesday', 'Wednesday']  # Días de la semana
-
-        for day in irrigation_days:
-            for irrigation_time in irrigation_times:
-                # Ajustar el día específico
-                job = getattr(schedule.every(), day.lower()).at(irrigation_time).do(self._iniciar_evento_riego)
-                self.irrigation_schedule.append(job)
-
-        logging.info(f"Horarios de riego programados: {irrigation_times} en días {irrigation_days}")
-
-    def _iniciar_evento_riego(self):
-        """
-        Inicia un evento de riego, obteniendo nuevas predicciones antes de regar.
+        Corrección simple de humedad fuera de umbrales.
+        CUIDADO: se libera el lock entre dos bloques consecutivos.
         """
         with self.lock:
-            if self.remaining_daily_water <= 0:
-                logging.info("No hay agua restante para distribuir en el riego de hoy.")
+            if self.is_busy:
                 return
 
-        # Obtener los valores actuales de los sensores
-        sensor_values = self._leer_sensores()
+        hum = sensor_values.get('humedad_avg', 50)
+        if hum < 10:
+            # Emergencia, ignorar restricción de bomba diario
+            logging.warning("Humedad < 10%. Emergencia => ignorar restricción de bomba diaria.")
+            decision = {
+                'activar_bomba': True,
+                'abrir_valvula_riego': True,
+                'emergencia': True,
+                'inyectar_fertilizante': False,
+                'abrir_valvula_suministro': False,
+                'porcentaje_fertilizante': 0,
+                'cantidad_agua': 5
+            }
+            self._ejecutar_decision(decision)
+            return
 
-        # Obtener una nueva decisión del motor de decisiones
-        decision = self.decision_engine.evaluar(sensor_values)
+        if hum < 20:
+            # Riego corto de 5 seg
+            with self.lock:
+                self.pump_control.activar()
+                self.valve_control.abrir_valvula('mora')
+            time.sleep(5)
+            with self.lock:
+                self.valve_control.cerrar_valvula('mora')
+                self.pump_control.desactivar()
+        elif hum > 90:
+            logging.warning("Humedad > 90%. Se sugiere no regar en este momento.")
 
-        # Actualizar la cantidad de agua y fertilizante para este evento
-        cantidad_agua = decision.get('cantidad_agua', 0)
-        porcentaje_fertilizante = decision.get('porcentaje_fertilizante', 0)
+    # =========================================================================
+    # PROGRAMAR RIEGO (lunes=0, martes=1, miércoles=2)
+    # =========================================================================
+    def _programar_riego_programado(self) -> None:
+        schedule.clear('riego_programado')
+        schedule.every().day.at("07:00").do(self._check_riego_programado).tag('riego_programado')
+        logging.info("Riego programado (lunes, martes, miércoles) a las 07:00h.")
 
-        with self.lock:
-            # Verificar si hay suficiente agua restante
-            if self.remaining_daily_water < cantidad_agua:
-                cantidad_agua = self.remaining_daily_water
+    def _check_riego_programado(self):
+        w = datetime.now().weekday()
+        if w in [0, 1, 2]:
+            self._evento_riego_programado()
 
-            # Actualizar agua restante
-            self.remaining_daily_water -= cantidad_agua
-
-        # Actualizar la decisión con la cantidad de agua ajustada
-        decision['cantidad_agua'] = cantidad_agua
-        decision['porcentaje_fertilizante'] = porcentaje_fertilizante
-
-        # Iniciar el riego en un hilo separado para no bloquear el ciclo principal
-        threading.Thread(target=self._controlar_riego, args=(decision,)).start()
-
-    def _controlar_riego(self, decision):
-        """
-        Controla el riego asegurándose de suministrar la cantidad exacta de agua y fertilizante.
-        """
+    def _evento_riego_programado(self) -> None:
+        logging.info("Evento de riego programado (IA).")
         try:
-            with self.lock:
-                self.is_busy = True  # Iniciando acción crítica
+            sensor_values = self._leer_sensores_global()
+            decision = self.decision_engine.evaluar(sensor_values)
 
-            logging.info(f"Iniciando evento de riego con {decision['cantidad_agua']} litros de agua.")
+            # 1) Coherencia
+            if not self._verificar_coherencia(sensor_values, decision):
+                logging.warning("Coherencia fallida => fallback o corrección.")
+                decision = self._decisiones_coherencia_fallback(sensor_values)
 
-            # Accionar los actuadores para el riego
-            self._accionar_actuadores(decision)
-
-            # Variables para monitorear el flujo
-            total_volume = 0.0  # Volumen total suministrado en litros
-            tiempo_inicio = time.time()
-            tiempo_ultimo = tiempo_inicio
-
-            # Tiempo máximo para prevenir riegos excesivamente largos (por ejemplo, 30 minutos)
-            tiempo_maximo_riego = 1800  # 30 minutos
-
-            while total_volume < decision['cantidad_agua']:
-                # Leer el caudal actual en litros por minuto
-                flow_rate = self.flow_sensor.leer()
-
-                # Tiempo transcurrido desde la última lectura
-                tiempo_actual = time.time()
-                delta_tiempo = tiempo_actual - tiempo_ultimo
-
-                # Calcular el volumen suministrado en este intervalo
-                volumen_intervalo = (flow_rate / 60) * delta_tiempo  # Convertir L/min a L
-
-                total_volume += volumen_intervalo
-                tiempo_ultimo = tiempo_actual
-
-                logging.debug(f"Caudal: {flow_rate:.2f} L/min, Volumen suministrado: {total_volume:.2f} L")
-
-                # Esperar un breve periodo antes de la siguiente lectura
-                time.sleep(1)
-
-                # Verificar si se ha excedido el tiempo máximo de riego
-                if (tiempo_actual - tiempo_inicio) > tiempo_maximo_riego:
-                    logging.warning("Tiempo máximo de riego excedido. Deteniendo riego para prevenir sobreirrigación.")
-                    break
-
-            # Finalizar el riego
-            self.pump_control.desactivar()
-            self.valve_control.cerrar_valvula('valvula_riego')
-            with self.lock:
-                self.actuator_states['bomba'] = False
-                self.actuator_states['valvula_riego'] = False
-
-            logging.info(f"Evento de riego completado. Volumen total suministrado: {total_volume:.2f} litros.")
-
-            # Registrar evento de riego
-            self._registrar_evento_riego(tiempo_inicio, time.time(), total_volume)
-
-            with self.lock:
-                self.is_busy = False  # Finalizando acción crítica
+            # 2) Umbrales
+            if not self._decision_dentro_umbrales(sensor_values, decision):
+                logging.warning("Decisión IA fuera de umbrales => corrección simple.")
+                self._corrigir_fuera_umbrales(sensor_values)
+            else:
+                self._ejecutar_decision(decision)
 
         except Exception:
-            logging.exception("Error durante el control del riego:")
-            # Asegurarse de desactivar los actuadores en caso de error
-            self.pump_control.desactivar()
-            self.valve_control.cerrar_valvula('valvula_riego')
-            with self.lock:
-                self.actuator_states['bomba'] = False
-                self.actuator_states['valvula_riego'] = False
-                self.is_busy = False
+            logging.exception("Error en _evento_riego_programado:")
 
-    def _registrar_evento_riego(self, tiempo_inicio, tiempo_fin, total_volume):
-        """
-        Registra los detalles del evento de riego en un archivo CSV.
-        """
-        irrigation_events_file = 'data/irrigation_events.csv'
-        file_exists = os.path.isfile(irrigation_events_file)
+    def _verificar_coherencia(self, sensor_values: Dict[str, Any], decision: Dict[str, Any]) -> bool:
+        ce_real = sensor_values.get('ce', 1.5)
+        hum = sensor_values.get('humedad_avg', 50)
+        fert_pct = decision.get('porcentaje_fertilizante', 0)
+        agua = decision.get('cantidad_agua', 0)
 
-        evento = {
-            'inicio': datetime.fromtimestamp(tiempo_inicio).strftime('%Y-%m-%d %H:%M:%S'),
-            'fin': datetime.fromtimestamp(tiempo_fin).strftime('%Y-%m-%d %H:%M:%S'),
-            'volumen': round(total_volume, 2)
+        if ce_real > 3.0 and fert_pct > 5:
+            logging.warning("Coherencia: CE alta con fertilizante elevado => Fail.")
+            return False
+        if hum >= 90 and agua > 10:
+            logging.warning("Coherencia: Humedad >=90 y agua>10 => Fail.")
+            return False
+        return True
+
+    def _decisiones_coherencia_fallback(self, sensor_values: Dict[str, Any]) -> Dict[str, Any]:
+        decision_fb: Dict[str, Any] = {
+            'activar_bomba': False,
+            'abrir_valvula_riego': False,
+            'inyectar_fertilizante': False,
+            'abrir_valvula_suministro': False,
+            'porcentaje_fertilizante': 0,
+            'cantidad_agua': 0
         }
+        ce = sensor_values.get('ce', 1.5)
+        if ce > 3.0:
+            decision_fb['activar_bomba'] = True
+            decision_fb['abrir_valvula_riego'] = True
+            decision_fb['porcentaje_fertilizante'] = 1.0
+            decision_fb['cantidad_agua'] = 5
+        else:
+            decision_fb['activar_bomba'] = True
+            decision_fb['abrir_valvula_riego'] = True
+            decision_fb['cantidad_agua'] = 8
+        return decision_fb
 
-        campos = ['inicio', 'fin', 'volumen']
+    def _decision_dentro_umbrales(self, sensor_values: Dict[str, Any], decision: Dict[str, Any]) -> bool:
+        ce_mora = sensor_values.get('ce', 2.0)
+        fert = decision.get('porcentaje_fertilizante', 0)
+        if ce_mora > 3.5 and fert > 10:
+            return False
+        return True
 
+    def _ejecutar_decision(self, decision: Dict[str, Any]) -> None:
+        """
+        ATENCIÓN sobre la sección con time.sleep(10):
+          - Actualmente se libera el lock durante esos 10 seg, lo cual permite que
+            otros hilos puedan modificar válvulas o la bomba en paralelo. Esto
+            podría provocar estados intermedios imprevistos.
+          - Si se desea bloquear completamente, se mantendría el lock durante toda
+            la operación (incluyendo el sleep). Aquí se deja como está para permitir
+            cierta concurrencia con cautela.
+        """
+        with self.lock:
+            if self.is_busy:
+                logging.warning("is_busy=True, se omite la acción para evitar conflicto.")
+                return
+            self.is_busy = True
+
+            # 1) Activar bomba, respetando la restricción diaria (salvo 'emergencia')
+            if decision.get('activar_bomba', False):
+                if not decision.get('emergencia', False) and self.bomba_activada_hoy:
+                    logging.warning("Bomba ya fue activada hoy, se omite nueva activación.")
+                else:
+                    # Encender bomba y apagar en 20 min (en hilo aparte)
+                    self._encender_bomba_contemporizada()
+                    self.bomba_activada_hoy = True
+                    self.ultimo_dia_bomba = datetime.now().date()
+            else:
+                self.pump_control.desactivar()
+
+            # 2) Válvula de riego
+            if decision.get('abrir_valvula_riego', False):
+                self.valve_control.abrir_valvula('mora')
+            else:
+                self.valve_control.cerrar_valvula('mora')
+
+            # 3) Fertilizante
+            if decision.get('inyectar_fertilizante', False):
+                fert_pct = decision.get('porcentaje_fertilizante', 0)
+                self._dosificar_fertilizante(fert_pct)
+
+            # 4) Válvula de suministro
+            if decision.get('abrir_valvula_suministro', False):
+                self.valve_control.abrir_valvula('suministro_pucp')
+            else:
+                self.valve_control.cerrar_valvula('suministro_pucp')
+
+            # Guardar en CSV
+            self._guardar_decision_csv(decision)
+
+        # Aquí liberamos el lock para permitir que otros hilos sigan
+        # corriendo, aunque hay un lapso de 10 seg de 'espera' local:
+        time.sleep(10)
+
+        # Re-adquirimos lock para cerrar la acción
+        with self.lock:
+            # Apagar bomba si sigue encendida (si no la apagó antes el hilo 20 min).
+            if self.pump_control.estado_actual():
+                self.pump_control.desactivar()
+            self.is_busy = False
+
+    # --------------------------------------------------------------------------
+    # Bomba con temporizador de 20 min
+    # --------------------------------------------------------------------------
+    def _encender_bomba_contemporizada(self) -> None:
+        self.pump_control.activar()
+        hilo_apagado = threading.Thread(target=self._apagar_bomba_despues_de_20, daemon=True)
+        hilo_apagado.start()
+
+    def _apagar_bomba_despues_de_20(self) -> None:
+        time.sleep(20 * 60)  # 20 min
+        with self.lock:
+            if self.pump_control.estado_actual():
+                self.pump_control.desactivar()
+                logging.info("Bomba desactivada automáticamente después de 20 min.")
+
+    def _dosificar_fertilizante(self, porcentaje: float) -> None:
+        logging.info(f"Dosificando fertilizante al {porcentaje}%.")
+        time.sleep(2)
+        logging.info("Dosificación completada.")
+
+    # =========================================================================
+    # DOMINGO ESPECIAL
+    # =========================================================================
+    def _programar_domingo_especial(self) -> None:
+        schedule.clear('domingo_especial')
+        schedule.every().day.at("08:00").do(self._check_domingo_especial).tag('domingo_especial')
+        logging.info("Domingo especial (fertilizante/entrenamiento) verificado a las 08:00h.")
+
+    def _check_domingo_especial(self):
+        w = datetime.now().weekday()
+        if w == 6:
+            self._evento_domingo()
+
+    def _evento_domingo(self) -> None:
+        hoy = datetime.now().date()
+        semana_del_mes = (hoy.day - 1) // 7 + 1
+        if semana_del_mes in [1, 3]:
+            logging.info("Domingo de fertilizante.")
+            self._funcion_dia_fertilizante()
+        else:
+            logging.info("Domingo de entrenamiento.")
+            self._funcion_dia_entrenamiento()
+
+    def _funcion_dia_fertilizante(self) -> None:
+        logging.info("Secuencia: vaciar->recargar->fertilizar")
+        if self.control_mode == 'automatic':
+            # 1) Vaciar tanque
+            self.valve_control.abrir_valvula('desague_1')
+            self.valve_control.abrir_valvula('desague_2')
+            logging.info("Desagües abiertos para vaciar. Esperando nivel <10.")
+            start_time = datetime.now()
+            timeout = timedelta(minutes=5)  # Máximo tiempo para vaciar el tanque
+
+            while True:
+                lvl_current = self.level_sensor.leer()
+                if lvl_current is None:
+                    logging.error("Sensor nivel no disponible. Abortando fertilización.")
+                    return
+                if lvl_current < 10:
+                    break
+                if datetime.now() - start_time > timeout:
+                    logging.warning("Timeout al intentar vaciar el tanque. Continuando...")
+                    break
+                time.sleep(5)
+
+            logging.info("Tanque vacío. Cerrando desagües.")
+            self.valve_control.cerrar_valvula('desague_1')
+            self.valve_control.cerrar_valvula('desague_2')
+
+            # 2) Recargar tanque
+            logging.info("Abriendo suministro_pucp. Esperando nivel >80.")
+            self.valve_control.abrir_valvula('suministro_pucp')
+            start_time = datetime.now()
+            timeout = timedelta(minutes=10)  # Máximo tiempo para llenar el tanque
+
+            while True:
+                lvl_current = self.level_sensor.leer()
+                if lvl_current is None:
+                    logging.error("Sensor nivel no disponible. Abortando fertilización.")
+                    return
+                if lvl_current > 80:
+                    break
+                if datetime.now() - start_time > timeout:
+                    logging.warning("Timeout al intentar llenar el tanque. Continuando...")
+                    break
+                time.sleep(5)
+
+            logging.info("Cerrando suministro_pucp.")
+            self.valve_control.cerrar_valvula('suministro_pucp')
+        else:
+            # Modo manual => sugerencias
+            self.gui.mostrar_sugerencia("Abra desagües para vaciar el tanque. Confirme cuando esté vacío.")
+            while not self.gui.recibir_confirmacion("tanque_vacio"):
+                time.sleep(5)
+
+            self.gui.mostrar_sugerencia("Abra suministro_pucp para recargar. Confirme cuando supere 80%.")
+            while not self.gui.recibir_confirmacion("tanque_lleno"):
+                time.sleep(5)
+                
+        # 3) Revisar pH, CE, NPK
+        sensor_values = self._leer_sensores_global()
+        ph = sensor_values.get('ph', 6.5)
+        ce = sensor_values.get('ce', 2.0)
+        N_val = sensor_values.get('N', 15.0)
+        P_val = sensor_values.get('P', 15.0)
+        K_val = sensor_values.get('K', 15.0)
+
+        fuera_de_rango = False
+        if not (5.5 <= ph <= 7.5):
+            fuera_de_rango = True
+        if ce > 3.0:
+            fuera_de_rango = True
+        if N_val > 50 or P_val > 50 or K_val > 50:
+            fuera_de_rango = True
+
+        if fuera_de_rango:
+            logging.warning("pH/CE/NPK fuera de rango => no fertilizar, riego corto.")
+            decision_emergente = {
+                'activar_bomba': True,
+                'abrir_valvula_riego': True,
+                'inyectar_fertilizante': False,
+                'abrir_valvula_suministro': False,
+                'porcentaje_fertilizante': 0,
+                'cantidad_agua': 5
+            }
+            self._ejecutar_decision(decision_emergente)
+            return
+
+        # Si está en rango => día de fertilizante normal
+        sensor_values['dia_fertilizante'] = True
+        decision = self.decision_engine.evaluar(sensor_values)
+        if not self._verificar_coherencia(sensor_values, decision):
+            logging.warning("Coherencia fallida en día fertil => fallback.")
+            decision = self._decisiones_coherencia_fallback(sensor_values)
+        if not self._decision_dentro_umbrales(sensor_values, decision):
+            logging.warning("Decisión fertilizante fuera de umbrales => corrección.")
+            self._corrigir_fuera_umbrales(sensor_values)
+        else:
+            self._ejecutar_decision(decision)
+
+    def _funcion_dia_entrenamiento(self) -> None:
+        if self._verificar_conexion_internet():
+            ok = self.cloud_sync.sincronizar_con_nube()
+            if ok:
+                self.decision_engine.cargar_modelo()
+        else:
+            pass
+
+    def _verificar_conexion_internet(self) -> bool:
         try:
-            with open(irrigation_events_file, mode='a', newline='') as archivo_csv:
-                escritor = csv.DictWriter(archivo_csv, fieldnames=campos)
-                if not file_exists:
-                    escritor.writeheader()
-                escritor.writerow(evento)
-            logging.info("Evento de riego registrado en irrigation_events.csv.")
-        except Exception:
-            logging.exception("Error al registrar evento de riego:")
+            requests.get("https://www.google.com", timeout=5)
+            return True
+        except:
+            return False
 
-    def _monitorear_almacenamiento(self):
-        """
-        Monitorea la capacidad de la microSD y elimina datos antiguos si se supera el 80% de su capacidad.
-        """
+    # =========================================================================
+    # MONITOREO ALMACENAMIENTO
+    # =========================================================================
+    def _monitorear_almacenamiento(self) -> None:
         try:
             total, used, free = shutil.disk_usage("/")
-            used_percentage = (used / total) * 100
-
-            if used_percentage >= 80:
-                logging.warning("Capacidad de almacenamiento superior al 80%. Eliminando datos antiguos.")
+            used_perc = (used / total) * 100
+            if used_perc > 80:
+                logging.warning("Almacenamiento >80%. Eliminando datos antiguos.")
                 self._eliminar_datos_antiguos()
-            else:
-                logging.info(f"Capacidad de almacenamiento utilizada: {used_percentage:.2f}%")
         except Exception:
-            logging.exception("Error al monitorear el almacenamiento:")
+            logging.exception("Error al monitorear almacenamiento:")
 
-    def _eliminar_datos_antiguos(self):
-        """
-        Elimina los datos más antiguos para liberar espacio, manteniendo al menos 3 meses de datos.
-        Antes de eliminar, realiza una copia de seguridad de los datos.
-        """
+    def _eliminar_datos_antiguos(self) -> None:
         try:
-            # Realizar copia de seguridad de datos
             self._backup_data_files()
-
-            # Definir la ruta de los archivos de datos
-            sensor_data_file = 'data/sensor_data.csv'
-            decision_data_file = 'data/decision_data.csv'
-
-            # Calcular la fecha límite (3 meses atrás)
-            cutoff_date = datetime.now() - timedelta(days=90)
-
-            # Función para filtrar y guardar datos recientes
-            def filtrar_datos_recientes(file_path):
-                if os.path.isfile(file_path):
-                    df = pd.read_csv(file_path)
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df_recientes = df[df['timestamp'] >= cutoff_date]
-                    df_recientes.to_csv(file_path, index=False)
-                    logging.info(f"Datos antiguos eliminados en {file_path}")
-                else:
-                    logging.warning(f"Archivo no encontrado: {file_path}")
-
-            # Filtrar datos en ambos archivos
-            filtrar_datos_recientes(sensor_data_file)
-            filtrar_datos_recientes(decision_data_file)
-
+            self._filtrar_csv_por_modo_control('data/sensor_data.csv')
+            self._filtrar_csv_por_modo_control('data/decision_data.csv')
         except Exception:
             logging.exception("Error al eliminar datos antiguos:")
 
-    def _backup_data_files(self):
-        """
-        Realiza una copia de seguridad de los archivos de datos antes de eliminar datos antiguos.
-        """
+    def _filtrar_csv_por_modo_control(self, file_path: str) -> None:
+        if not os.path.isfile(file_path):
+            return
+        df = pd.read_csv(file_path)
+        if 'timestamp' not in df.columns or 'modo_control' not in df.columns:
+            return
+
+        df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
+        now = datetime.now()
+        cutoff_auto = now - timedelta(days=90)
+        cutoff_manual = now - timedelta(days=180)
+
+        mask_auto = (df['modo_control'] == 'automatic')
+        mask_manual = (df['modo_control'] == 'manual')
+
+        df_auto = df[mask_auto & (df['timestamp'] >= cutoff_auto)]
+        df_manual = df[mask_manual & (df['timestamp'] >= cutoff_manual)]
+        df_new = pd.concat([df_auto, df_manual], ignore_index=True)
+        df_new.sort_values('timestamp', inplace=True)
+
+        df_new.to_csv(file_path, index=False)
+        logging.info(f"Filtrados datos antiguos en {file_path}, 90d auto y 180d manual.")
+
+    def _backup_data_files(self) -> None:
         try:
             backup_dir = 'data/backup'
             os.makedirs(backup_dir, exist_ok=True)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            now_str = datetime.now().strftime('%Y%m%d_%H%M%S')
 
-            files_to_backup = ['data/sensor_data.csv', 'data/decision_data.csv']
-            for file_path in files_to_backup:
-                if os.path.isfile(file_path):
-                    backup_path = os.path.join(backup_dir, f"{os.path.basename(file_path)}_{timestamp}")
-                    shutil.copy2(file_path, backup_path)
-                    logging.info(f"Copia de seguridad creada: {backup_path}")
+            for fpath in ['data/sensor_data.csv', 'data/decision_data.csv']:
+                if os.path.isfile(fpath):
+                    base_name = os.path.basename(fpath).replace('.csv', '')
+                    bkp_name = f"{base_name}_{now_str}.csv.gz"
+                    bkp_path = os.path.join(backup_dir, bkp_name)
+
+                    with open(fpath, 'rb') as f_in:
+                        with gzip.open(bkp_path, 'wb') as f_out:
+                            shutil.copyfileobj(f_in, f_out)
+
+                    logging.info(f"Backup creado: {bkp_path}")
+
+        except Exception:
+            logging.exception("Error en backup_data_files:")
+
+    # =========================================================================
+    # REGISTRO DE DECISIONES
+    # =========================================================================
+    def _guardar_decision_csv(self, decision: Dict[str, Any]) -> None:
+        file_path = 'data/decision_data.csv'
+        file_exists = os.path.isfile(file_path)
+        now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
+        row = {**decision, 'timestamp': now_str}
+        row['modo_control'] = self.control_mode
+
+        for key in [
+            'activar_bomba','abrir_valvula_riego',
+            'inyectar_fertilizante','abrir_valvula_suministro',
+            'porcentaje_fertilizante','cantidad_agua'
+        ]:
+            if key not in row:
+                if 'abrir_valvula' in key or 'inyectar' in key or 'activar_bomba' in key:
+                    row[key] = False
                 else:
-                    logging.warning(f"No se encontró el archivo para respaldar: {file_path}")
-        except Exception:
-            logging.exception("Error al realizar copia de seguridad de los datos:")
+                    row[key] = 0
 
-    def _programar_sincronizacion_semanal(self):
-        """
-        Programa la sincronización semanal con la nube en horario nocturno.
-        """
-        # Programar sincronización a las 2 AM si no está ocupado
-        with self.lock:
-            if not self.is_busy:
-                schedule.every().week.do(self._sincronizar_con_nube).tag('sincronizacion_semanal')
-                logging.info("Sincronización semanal programada a las 2 AM.")
-            else:
-                logging.warning("El sistema está ocupado. La sincronización semanal se reprogramará.")
-                schedule.every(1).hours.do(self._programar_sincronizacion_semanal)
-
-    def _sincronizar_con_nube(self):
-        """
-        Sincroniza los datos locales con la nube y actualiza el modelo de Machine Learning si hay
-        una versión más reciente disponible en la nube.
-        """
-        try:
-            with self.lock:
-                if self.is_busy:
-                    logging.warning("El sistema está ocupado. Posponiendo sincronización con la nube.")
-                    return
-
-            # Realizar sincronización completa con la nube
-            sincronizacion_exitosa = self.cloud_sync.sincronizar_con_nube()
-
-            if sincronizacion_exitosa:
-                # Cargar el modelo actualizado en el decision_engine
-                self.decision_engine.cargar_modelo()
-                logging.info("Modelo de Machine Learning actualizado desde la nube.")
-            else:
-                logging.warning("La sincronización con la nube no fue exitosa. Se mantendrá el modelo anterior.")
-
-        except Exception:
-            logging.exception("Error en sincronización con la nube:")
-
-    def _guardar_decision_csv(self, sensor_values, decision):
-        """
-        Guarda las decisiones tomadas junto con los datos de sensores en un archivo CSV.
-        """
-        decision_csv = 'data/decision_data.csv'
-        file_exists = os.path.isfile(decision_csv)
-
-        # Convertir timestamp a formato legible sin modificar sensor_values
-        timestamp_str = datetime.fromtimestamp(sensor_values['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
-
-        # Combinar sensor_values y decision en un solo diccionario
-        data = {**sensor_values, **decision}
-
-        # Crear una copia para escribir en el CSV
-        data_csv = data.copy()
-        data_csv['timestamp'] = timestamp_str
-
-        # Campos del CSV
-        campos = ['timestamp', 'humidity', 'temperature', 'ph', 'ce', 'water_level', 'flow_rate', 'season',
-                  'activar_bomba', 'abrir_valvula_riego', 'inyectar_fertilizante', 'abrir_valvula_suministro',
-                  'porcentaje_fertilizante', 'cantidad_agua']
-
-        # Asegurarse de que todos los campos de actuadores están presentes
-        for key in ['activar_bomba', 'abrir_valvula_riego', 'inyectar_fertilizante', 'abrir_valvula_suministro']:
-            if key not in data_csv or data_csv[key] is None:
-                data_csv[key] = False
-
-        # Asegurarse de que 'water_level' está presente
-        if 'water_level' not in data_csv:
-            data_csv['water_level'] = None
-
-        # Asegurarse de que 'porcentaje_fertilizante' y 'cantidad_agua' están presentes
-        if 'porcentaje_fertilizante' not in data_csv:
-            data_csv['porcentaje_fertilizante'] = 0
-        if 'cantidad_agua' not in data_csv:
-            data_csv['cantidad_agua'] = 0
+        campos = list(row.keys())
+        if 'timestamp' not in campos:
+            campos.insert(0, 'timestamp')
 
         try:
-            # Escribir en el CSV usando data_csv
-            with open(decision_csv, mode='a', newline='') as archivo_csv:
-                escritor = csv.DictWriter(archivo_csv, fieldnames=campos)
+            with open(file_path, 'a', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=campos)
                 if not file_exists:
-                    escritor.writeheader()
-                escritor.writerow(data_csv)
-
-            logging.info("Decisión guardada en decision_data.csv.")
-
+                    writer.writeheader()
+                writer.writerow(row)
+            logging.info("Decisión registrada en decision_data.csv.")
         except Exception:
-            logging.exception("Error al guardar decisión en CSV:")
-            raise
+            logging.exception("Error al guardar decision_data.csv:")
+
+    # =========================================================================
+    # OBTENER ESTADO DE ACTUADORES
+    # =========================================================================
+    def get_actuators_state(self) -> Dict[str, bool]:
+        """
+        Retorna un dict con estado actual de la bomba y cada válvula.
+        """
+        estados: Dict[str, bool] = {}
+        estados['bomba_dc'] = self.pump_control.estado_actual()
+        for nombre_valvula in self.valve_control.valvulas.keys():
+            estados[nombre_valvula] = self.valve_control.estado_actual(nombre_valvula)
+        return estados
+
+    # =========================================================================
+    # FIN
+    # =========================================================================
