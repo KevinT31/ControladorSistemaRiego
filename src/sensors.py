@@ -1,4 +1,12 @@
 # sensors.py
+# -------------------------------------------------------------------------------
+# Módulo de sensores para el sistema de riego inteligente.
+# Incluye:
+#   - SoilSensor7en1 (Modbus RS485) => (Temperatura, Humedad, CE, pH, N, P, K)
+#   - LevelSensor (US-100 Trigger/Echo)
+#   - FlowSensor (FS300A)
+#   - Manejo de GPIO y simulación en Windows.
+# -------------------------------------------------------------------------------
 
 import time
 import logging
@@ -6,481 +14,609 @@ import threading
 import random
 import sys
 
-# Importar librerías necesarias para Modbus RTU sobre RS485
+# Para Modbus RTU sobre RS485
 try:
     from pymodbus.client import ModbusSerialClient
 except ImportError:
-    logging.warning("Librería pymodbus no disponible. Ejecutando en modo simulado.")
+    logging.warning("Librería pymodbus no disponible. Modo simulado para sensores Modbus.")
     ModbusSerialClient = None
 
-# Simular RPi.GPIO solo si no estamos en una Raspberry Pi
+# Simular RPi.GPIO si no estamos en Raspberry Pi
 if sys.platform == "win32":
     from unittest.mock import MagicMock
     GPIO = MagicMock()
-    logging.warning("Librerías de hardware no disponibles. Ejecutando en modo simulado.")
+    logging.warning("GPIO no disponible en este entorno (Windows). Modo simulado.")
 else:
     try:
         import RPi.GPIO as GPIO
     except ImportError:
-        logging.warning("Librerías de RPi.GPIO no disponibles en este entorno.")
+        logging.warning("RPi.GPIO no disponible en este entorno. Modo simulado.")
         GPIO = None
 
-# Configuración del logging
+# Configuración de logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 
-# Configurar GPIO
+# -------------------------------------------------------------------------------
+# Configuración de pines (en caso de usar Raspberry Pi real)
+# -------------------------------------------------------------------------------
 if GPIO is not None:
-    GPIO.setmode(GPIO.BCM)
+    GPIO.setmode(GPIO.BOARD)
 
-    # Pines para RS485 (MAX485 o similar)
-    DE_RE_PIN = 27  # GPIO 27 para DE y RE del MAX485
+    # Pines RS485 (MAX485: DE/RE) - Modo half-duplex
+    DE_RE_PIN = 27  # GPIO 27 para controlar transmisión/recepción
+    GPIO.setup(DE_RE_PIN, GPIO.OUT)
 
     # Pines para sensor de flujo
-    FLOW_SENSOR_PIN = 17  # GPIO 17 - Salida de pulsos del sensor de flujo
+    FLOW_SENSOR_PIN = 17
 
     # Pines para sensor US-100
-    TRIG_PIN = 18  # TRIG del sensor US-100
-    ECHO_PIN = 24  # ECHO del sensor US-100
+    TRIG_PIN = 18
+    ECHO_PIN = 24
 
-    # Configurar pines de alimentación si es necesario
-    # NOTA: No se recomienda usar GPIO para alimentación de sensores
 
+# -------------------------------------------------------------------------------
+# Clase base de sensores Modbus RS485 (SensorBase)
+# -------------------------------------------------------------------------------
 class SensorBase:
     """
-    Clase base para los sensores Modbus.
+    Clase base para sensores Modbus (RS485). Cada instancia manejará su propio 
+    cliente ModbusSerialClient y su propio lock, permitiendo hilos en paralelo 
+    cuando se dispone de puertos físicos separados (p.ej. /dev/ttyUSB0, /dev/ttyUSB1, etc.).
     """
-    modbus_client = None
-    modbus_lock = threading.Lock()
 
-    @classmethod
-    def initialize_modbus_client(cls):
-        if cls.modbus_client is None:
-            if not GPIO:
-                logging.error("GPIO no está disponible. No se puede inicializar Modbus.")
-                return
-            # Configurar el cliente Modbus RTU
-            serial_port = '/dev/ttyS0'  # Ajustar según la configuración de la Raspberry Pi
-            cls.modbus_client = ModbusSerialClient(
-                method='rtu',
-                port=serial_port,
-                baudrate=9600,
-                bytesize=8,
-                parity='N',
-                stopbits=1,
-                timeout=1,
-            )
-            if cls.modbus_client.connect():
-                logging.info("Cliente Modbus conectado exitosamente.")
-            else:
-                logging.error("Fallo al conectar el cliente Modbus.")
-
-    def __init__(self, address, calibration_params=None):
+    def __init__(self, address, serial_port='/dev/ttyUSB0', calibration_params=None):
         """
-        Inicializa el sensor con la dirección Modbus y parámetros de calibración.
+        :param address: Dirección (ID) Modbus del sensor.
+        :param serial_port: Puerto serie donde está conectado el sensor 
+                            (ej. '/dev/ttyUSB0', '/dev/ttyUSB1', etc.).
+        :param calibration_params: Opcional, dict con parámetros de calibración específicos.
         """
-        self.address = address  # ID del esclavo Modbus
+        self.address = address
+        self.serial_port = serial_port
         self.calibration_params = calibration_params or {}
         self.last_reading = None
-        self.simulation_mode = sys.platform == "win32"
+        self.simulation_mode = (sys.platform == "win32")  # Modo simulado en Windows
+        
+        # Cada sensor tendrá su propio cliente y su propio lock
+        self.modbus_client = None
+        self.modbus_lock = threading.Lock()
 
-        # Implementación de lock para seguridad de hilos
-        self.lock = threading.Lock()
-
-        if not self.simulation_mode:
-            self.initialize_modbus_client()
+        self.lock = threading.Lock()  # Para proteger self.last_reading
+        if not self.simulation_mode and GPIO is not None:
+            self._initialize_modbus_client()
         else:
-            logging.info(f"Sensor en dirección {self.address} inicializado en modo simulado.")
+            logging.info(f"Sensor Modbus en dirección {self.address} iniciado en modo simulado.")
+
+    def _initialize_modbus_client(self):
+        """
+        Inicializa el cliente ModbusSerialClient para este sensor.
+        Ajustar parámetros según el manual del sensor (4800 baudios, 8N1).
+        """
+        if not GPIO:
+            logging.error("GPIO no disponible. No se puede inicializar Modbus en modo real.")
+            return
+
+        self.modbus_client = ModbusSerialClient(
+            method='rtu',
+            port=self.serial_port,
+            baudrate=4800,  # Según especificación por defecto del sensor SoilSensor7en1
+            bytesize=8,
+            parity='N',
+            stopbits=1,
+            timeout=1,
+        )
+        if self.modbus_client.connect():
+            logging.info(f"Cliente Modbus conectado correctamente en {self.serial_port}, addr={self.address}.")
+        else:
+            logging.error(f"Fallo al conectar el cliente Modbus en {self.serial_port}, addr={self.address}.")
 
     def leer_modbus(self, register_address, register_count):
         """
-        Lee los registros Modbus del sensor.
+        Lectura genérica de registros Modbus (holding registers).
+        - Retorna la lista de valores leídos o None si falla.
+        - Hasta 3 intentos. Si da error, se cierra y re-conecta el cliente,
+          se hace un pequeño back-off (0.2 s), y se reintenta.
+
+        IMPORTANTE: Este método usa self.modbus_lock para
+        garantizar el acceso ordenado al bus RS485 en modo half-duplex.
         """
-        if not self.simulation_mode and self.modbus_client:
-            try:
-                with self.modbus_lock:
-                    # Controlar DE/RE para transmisión y recepción
-                    GPIO.output(DE_RE_PIN, GPIO.HIGH)  # Modo transmisión
-                    time.sleep(0.01)  # Pequeña espera para cambio de modo
-                    result = self.modbus_client.read_holding_registers(
-                        address=register_address,
-                        count=register_count,
-                        unit=self.address
-                    )
-                    GPIO.output(DE_RE_PIN, GPIO.LOW)  # Modo recepción
-                if not result.isError():
-                    logging.debug(f"Lectura Modbus desde dirección {self.address}: {result.registers}")
-                    return result.registers
-                else:
-                    logging.error(f"Error al leer Modbus en dirección {self.address}: {result}")
-                    raise IOError("Error al leer Modbus")
-            except Exception:
-                logging.exception(f"Error al leer Modbus en dirección {self.address}:")
-                raise
+        if not self.simulation_mode and self.modbus_client is not None:
+            for attempt in range(3):
+                try:
+                    with self.modbus_lock:
+                        # Modo transmisión
+                        GPIO.output(DE_RE_PIN, GPIO.HIGH)
+                        time.sleep(0.01)
+
+                        result = self.modbus_client.read_holding_registers(
+                            address=register_address,
+                            count=register_count,
+                            unit=self.address
+                        )
+
+                        # Modo recepción
+                        GPIO.output(DE_RE_PIN, GPIO.LOW)
+
+                    if not result.isError():
+                        logging.debug(f"Modbus OK (addr={self.address}): {result.registers}")
+                        return result.registers
+                    else:
+                        logging.error(f"Error Modbus addr={self.address}: {result}")
+                        self.modbus_client.close()
+                        time.sleep(0.2)  # pequeño delay antes de reconectar
+
+                        if not self.modbus_client.connect():
+                            logging.error("No se pudo reconectar al ModbusClient.")
+                            if attempt < 2:
+                                time.sleep(0.2)
+                            else:
+                                logging.error("Error al leer registros Modbus tras 3 intentos.")
+                                return None
+                        else:
+                            # Reintento inmediato tras reconexión
+                            with self.modbus_lock:
+                                GPIO.output(DE_RE_PIN, GPIO.HIGH)
+                                time.sleep(0.01)
+                                second_result = self.modbus_client.read_holding_registers(
+                                    address=register_address,
+                                    count=register_count,
+                                    unit=self.address
+                                )
+                                GPIO.output(DE_RE_PIN, GPIO.LOW)
+
+                            if not second_result.isError():
+                                logging.debug(f"Reintento exitoso (addr={self.address}): {second_result.registers}")
+                                return second_result.registers
+                            else:
+                                logging.error(f"Error tras reconexión Modbus addr={self.address}: {second_result}")
+                                if attempt < 2:
+                                    time.sleep(0.2)
+                                else:
+                                    logging.error("Error al leer registros Modbus tras 3 intentos (con reconexión).")
+                                    return None
+
+                except Exception:
+                    logging.exception(f"Excepción al leer Modbus addr={self.address} (intento {attempt + 1}/3):")
+                    if attempt < 2:
+                        time.sleep(0.2)
+                    else:
+                        return None
+
+            return None
         else:
-            # Modo simulado
+            # Modo simulado: generamos valores aleatorios
             return [random.randint(0, 1000) for _ in range(register_count)]
 
     def calibrar(self, raw_value):
         """
-        Aplica la calibración al valor bruto leído vía Modbus.
-        Este método debe ser implementado por cada sensor específico.
+        Se implementa en las subclases si se necesita calibración específica.
         """
-        raise NotImplementedError("El método calibrar() debe ser implementado por subclases.")
+        raise NotImplementedError("calibrar() debe implementarse en subclases.")
 
     def leer(self):
         """
-        Lee el valor del sensor, aplica calibración y detecta posibles fallos.
-        :return: Valor calibrado del sensor.
+        Método genérico de lectura. Se implementa en cada subclase.
         """
-        raise NotImplementedError("El método leer() debe ser implementado por las subclases.")
+        raise NotImplementedError("leer() debe implementarse en subclases.")
 
     def detectar_fallo(self):
         """
-        Implementa la lógica para detectar fallos en el sensor.
+        Verifica si hay fallo en la lectura (cada subclase define sus criterios).
         """
-        pass
+        return False
 
-class SoilSensor(SensorBase):
+
+# -------------------------------------------------------------------------------
+# SoilSensor7en1: sensor RS485 con 7 parámetros (Temp, Humedad, CE, pH, N, P, K)
+# -------------------------------------------------------------------------------
+class SoilSensor7en1(SensorBase):
     """
-    Sensor 4 en 1 RS485 que mide temperatura, humedad, CE y pH.
+    Sensor 7 en 1 RS485 que lee:
+      - Temperatura
+      - Humedad
+      - CE (Conductividad eléctrica)
+      - pH
+      - N (nitrógeno)
+      - P (fósforo)
+      - K (potasio)
+
+    Emplea registros holding Modbus. 
     """
-    def __init__(self, address, calibration_params=None):
-        super().__init__(address, calibration_params)
-        self.register_address = 0x0000  # Dirección inicial del registro
-        self.register_count = 4         # Cantidad de registros a leer (humedad, temperatura, CE, pH)
-        logging.info("Sensor de Suelo 4 en 1 inicializado.")
+
+    def __init__(self, address, serial_port='/dev/ttyUSB0', calibration_params=None):
+        super().__init__(address, serial_port, calibration_params)
+        self.register_address = 0x0000  # Registro inicial (según datasheet)
+        self.register_count = 7         # 7 parámetros
+        logging.info(f"Sensor de Suelo 7 en 1 inicializado (addr={address}, port={serial_port}).")
 
     def leer(self):
         """
-        Lee todos los valores del sensor y los calibra.
-        :return: Diccionario con humedad, temperatura, CE y pH.
+        Lee los 7 valores y los almacena en self.last_reading.
+        Retorna un dict con las claves:
+          { 'humidity', 'temperature', 'ce', 'ph', 'N', 'P', 'K' }
+        o None si falla.
         """
-        if not self.simulation_mode:
+        if not self.simulation_mode and GPIO is not None:
             try:
                 raw_values = self.leer_modbus(self.register_address, self.register_count)
-                if raw_values:
-                    humidity_raw = raw_values[0]
-                    temperature_raw = raw_values[1]
+                if raw_values and len(raw_values) == 7:
+                    h_raw = raw_values[0]
+                    t_raw = raw_values[1]
                     ce_raw = raw_values[2]
                     ph_raw = raw_values[3]
+                    n_raw = raw_values[4]
+                    p_raw = raw_values[5]
+                    k_raw = raw_values[6]
 
-                    humidity = humidity_raw / 10.0  # Humedad en %
-                    temperature = self._calibrar_temperatura(temperature_raw)  # Temperatura en °C
-                    ce = ce_raw  # CE en μS/cm
-                    ph = ph_raw / 10.0  # pH
+                    # Conversión/calibración simples
+                    humidity = h_raw / 10.0
+                    temperature = self._calibrar_temperatura(t_raw)
+                    ce = float(ce_raw)  # μS/cm
+                    ph = ph_raw / 10.0
+                    n_val = float(n_raw)
+                    p_val = float(p_raw)
+                    k_val = float(k_raw)
 
                     with self.lock:
                         self.last_reading = {
-                            'humidity': humidity,
+                            'humidity':    humidity,
                             'temperature': temperature,
-                            'ce': ce,
-                            'ph': ph
+                            'ce':          ce,
+                            'ph':          ph,
+                            'N':           n_val,
+                            'P':           p_val,
+                            'K':           k_val
                         }
 
-                    logging.debug(f"Valores calibrados: {self.last_reading}")
-
-                    # Detectar fallos
+                    logging.debug(f"SoilSensor7en1 => {self.last_reading}")
                     if self.detectar_fallo():
                         return None
-
                     return self.last_reading
                 else:
-                    logging.error("No se pudieron obtener los valores del sensor de suelo.")
+                    logging.error("No se obtuvieron 7 registros válidos del sensor 7en1.")
                     return None
             except Exception:
-                logging.exception("Error al leer el sensor de suelo:")
+                logging.exception("Error al leer SoilSensor7en1:")
                 return None
         else:
-            # Modo simulado con valores realistas
+            # Modo simulado
             with self.lock:
                 self.last_reading = {
-                    'humidity': random.uniform(30, 70),
+                    'humidity':    random.uniform(30, 70),
                     'temperature': random.uniform(10, 30),
-                    'ce': random.uniform(1.0, 2.5),
-                    'ph': random.uniform(5.5, 7.5)
+                    'ce':          random.uniform(1.0, 2.5),
+                    'ph':          random.uniform(5.5, 7.5),
+                    'N':           random.uniform(10, 60),
+                    'P':           random.uniform(5, 40),
+                    'K':           random.uniform(10, 50)
                 }
-            logging.debug(f"Valores simulados: {self.last_reading}")
+            logging.debug(f"SoilSensor7en1 (sim) => {self.last_reading}")
             return self.last_reading
 
-    def _calibrar_temperatura(self, raw_value):
+    def _calibrar_temperatura(self, raw_val):
         """
-        Calibra el valor de temperatura, considerando números negativos.
+        Manejo de signo para temperatura si el valor viene en complemento a 2.
         """
-        if raw_value >= 0x8000:
-            # Número negativo en complemento a dos
-            temperature = -(0x10000 - raw_value) / 10.0
+        if raw_val >= 0x8000:  # bit 15 en 1 => valor negativo
+            return -(0x10000 - raw_val) / 10.0
         else:
-            temperature = raw_value / 10.0
-        return temperature
+            return raw_val / 10.0
 
     def detectar_fallo(self):
         """
-        Verifica si los valores leídos están dentro de rangos aceptables.
+        Chequea rangos básicos (humedad, temp, CE, pH, N, P, K).
+        ADVERTENCIA: pH > 9 se considera fallo. Ajustar si tu rango real es mayor.
         """
         with self.lock:
             if self.last_reading is None:
-                logging.error("No hay lectura disponible del sensor de suelo.")
+                logging.error("No hay lectura disponible en SoilSensor7en1.")
                 return True
-            # Verificar valores fuera de rango
-            if not (0 <= self.last_reading['humidity'] <= 100):
-                logging.error(f"Lectura de humedad fuera de rango: {self.last_reading['humidity']}")
+
+            h = self.last_reading['humidity']
+            t = self.last_reading['temperature']
+            c = self.last_reading['ce']
+            pH = self.last_reading['ph']
+            n_ = self.last_reading['N']
+            p_ = self.last_reading['P']
+            k_ = self.last_reading['K']
+
+            # Humedad
+            if not (0 <= h <= 100):
+                logging.error(f"Humedad fuera de rango: {h}")
                 return True
-            if not (-40 <= self.last_reading['temperature'] <= 80):
-                logging.error(f"Lectura de temperatura fuera de rango: {self.last_reading['temperature']}")
+            # Temperatura
+            if not (-40 <= t <= 80):
+                logging.error(f"Temperatura fuera de rango: {t}")
                 return True
-            if not (0 <= self.last_reading['ce'] <= 2000):
-                logging.error(f"Lectura de CE fuera de rango: {self.last_reading['ce']}")
+            # CE (μS/cm)
+            if not (0 <= c <= 20000):
+                logging.error(f"CE fuera de rango: {c}")
                 return True
-            if not (3 <= self.last_reading['ph'] <= 9):
-                logging.error(f"Lectura de pH fuera de rango: {self.last_reading['ph']}")
+            # pH
+            if not (3 <= pH <= 9):
+                logging.error(f"pH fuera de rango: {pH}")
                 return True
+            # N, P, K
+            if not (0 <= n_ <= 2000):
+                logging.error(f"N fuera de rango: {n_}")
+                return True
+            if not (0 <= p_ <= 2000):
+                logging.error(f"P fuera de rango: {p_}")
+                return True
+            if not (0 <= k_ <= 2000):
+                logging.error(f"K fuera de rango: {k_}")
+                return True
+
         return False
 
+
+# -------------------------------------------------------------------------------
+# LevelSensor: sensor de nivel (US-100) con Trigger/Echo
+# -------------------------------------------------------------------------------
 class LevelSensor:
     """
-    Sensor de nivel de agua US-100 en modo Trigger/Echo.
+    Sensor de nivel (US-100) con Trigger/Echo para medir distancia en cm
+    y convertir a % de nivel, dada una altura nominal 'tank_height'.
+
+    Mejoras/Advertencias:
+      - _medir_distancia() usa un while bloqueante con un timeout de ~1s.
+      - En sistemas no deterministas, si hay interrupciones largas, puede dar
+        falsos timeouts o lecturas inconsistentes.
     """
+
     def __init__(self, trig_pin, echo_pin, calibration_params=None):
         self.trig_pin = trig_pin
         self.echo_pin = echo_pin
         self.calibration_params = calibration_params or {}
         self.last_reading = None
-        self.simulation_mode = sys.platform == "win32"
-        self.simulated_water_level = 79.0  # Nivel inicial en porcentaje
-        # Implementación de lock para seguridad de hilos
+        self.simulation_mode = (sys.platform == "win32")
+        self.simulated_water_level = 79.0  # Valor de arranque simulado en %
+
         self.lock = threading.Lock()
 
-        if not self.simulation_mode:
+        if not self.simulation_mode and GPIO is not None:
             GPIO.setup(self.trig_pin, GPIO.OUT)
             GPIO.setup(self.echo_pin, GPIO.IN)
-            logging.info("Sensor de Nivel de Agua inicializado.")
+            logging.info("LevelSensor (US-100) inicializado en modo real.")
         else:
-            logging.info("Sensor de Nivel de Agua inicializado en modo simulado.")
+            logging.info("LevelSensor en modo simulado.")
 
     def leer(self, bomba_activa=False, num_samples=5):
         """
-        Lee la distancia medida por el sensor ultrasonido y calcula el nivel de agua.
-        Toma múltiples muestras y calcula un promedio para reducir el ruido.
+        Toma 'num_samples' mediciones para reducir ruido y calcula el promedio.
+        Convierte la distancia a porcentaje de nivel (con 'tank_height').
+
+        :param bomba_activa: bool, si la bomba está encendida (afecta simulación).
+        :param num_samples: número de muestras para promediar.
+        :return: Porcentaje de nivel (0..100) o None si fallo.
         """
-        if not self.simulation_mode:
+        if not self.simulation_mode and GPIO is not None:
             try:
                 distances = []
                 for _ in range(num_samples):
-                    distance = self._medir_distancia()
-                    if distance is not None:
-                        distances.append(distance)
-                    time.sleep(0.1)  # Pequeña espera entre lecturas
+                    dist = self._medir_distancia()
+                    if dist is not None:
+                        distances.append(dist)
+                    time.sleep(1)  # Pequeño delay entre muestras
 
                 if distances:
-                    average_distance = sum(distances) / len(distances)
-                    # Calcular nivel de agua en porcentaje
-                    tank_height = self.calibration_params.get('tank_height', 80)  # Altura del tanque en cm
-                    nivel = ((tank_height - average_distance) / tank_height) * 100
-                    nivel = max(0, min(100, nivel))  # Limitar entre 0% y 100%
+                    avg_dist = sum(distances) / len(distances)
+                    tank_height = self.calibration_params.get('tank_height', 80)
+                    # Convertir distancia a % nivel
+                    nivel = (tank_height - avg_dist) / tank_height * 100
+                    nivel = max(0, min(100, nivel))  # Limitar a 0..100
+
                     with self.lock:
                         self.last_reading = nivel
 
-                    logging.debug(f"Nivel de agua medido: {nivel:.2f}%")
-
-                    # Detectar fallos
+                    logging.debug(f"LevelSensor => {nivel:.2f}%")
                     if self.detectar_fallo():
                         return None
-
                     return nivel
                 else:
-                    logging.error("No se pudo leer distancia del sensor ultrasónico.")
+                    logging.error("No se pudo medir distancia del sensor ultrasónico en ninguna muestra.")
                     return None
             except Exception:
-                logging.exception("Error al leer el sensor de nivel de agua:")
+                logging.exception("Error leyendo LevelSensor:")
                 return None
+
         else:
+            # Modo simulado
             with self.lock:
                 if bomba_activa:
-                    # Disminuir el nivel de agua simulando el consumo
-                    decrement = 0.5  # Decremento por lectura
-                    self.simulated_water_level = max(self.simulated_water_level - decrement, 0.0)
+                    # Si la bomba está activa, bajamos el nivel
+                    dec = 0.5
+                    self.simulated_water_level = max(self.simulated_water_level - dec, 0.0)
                 else:
-                    # Recuperación lenta del nivel (por ejemplo, por lluvia)
-                    increment = 0.1  # Incremento por lectura
-                    self.simulated_water_level = min(self.simulated_water_level + increment, 100.0)
+                    # Recuperación lenta (llenado)
+                    inc = 0.1
+                    self.simulated_water_level = min(self.simulated_water_level + inc, 100.0)
 
-                nivel = self.simulated_water_level
-                self.last_reading = nivel
+                self.last_reading = self.simulated_water_level
 
-            logging.debug(f"Nivel de agua simulado: {nivel:.2f}%")
-            return nivel
+            logging.debug(f"LevelSensor(sim) => {self.last_reading:.2f}%")
+            if self.detectar_fallo():
+                return None
+            return self.last_reading
 
     def _medir_distancia(self):
         """
-        Realiza una medición de distancia con el sensor ultrasónico.
+        Envía pulso TRIG, mide duración del pulso ECHO y convierte a cm.
+        Retorna la distancia o None en caso de timeout/error.
         """
         try:
-            # Asegurarse de que el pin TRIG está bajo
             GPIO.output(self.trig_pin, False)
-            time.sleep(0.0002)
+            time.sleep(0.0002)  # Pequeño delay
 
-            # Enviar un pulso de 10μs en el pin TRIG
             GPIO.output(self.trig_pin, True)
             time.sleep(0.00001)
             GPIO.output(self.trig_pin, False)
 
-            # Medir el tiempo de respuesta del eco
-            timeout = time.time() + 1  # Timeout de 1 segundo
-
+            timeout = time.time() + 1
             while GPIO.input(self.echo_pin) == 0:
-                inicio_pulso = time.time()
-                if inicio_pulso > timeout:
-                    logging.error("Timeout esperando inicio del pulso ECHO")
+                inicio = time.time()
+                if inicio > timeout:
+                    logging.error("Timeout esperando inicio pulso ECHO (LOW->HIGH).")
                     return None
 
             while GPIO.input(self.echo_pin) == 1:
-                fin_pulso = time.time()
-                if fin_pulso > timeout:
-                    logging.error("Timeout esperando fin del pulso ECHO")
+                fin = time.time()
+                if fin > timeout:
+                    logging.error("Timeout esperando fin pulso ECHO (HIGH->LOW).")
                     return None
 
-            duracion_pulso = fin_pulso - inicio_pulso
-
-            # Calcular la distancia (velocidad del sonido 34300 cm/s)
-            distancia = (duracion_pulso * 34300) / 2  # En cm
-
-            return distancia
+            duracion = fin - inicio
+            distancia_cm = (duracion * 34300) / 2
+            return distancia_cm
         except Exception:
-            logging.exception("Error al medir distancia con el sensor ultrasónico:")
+            logging.exception("Error midiendo distancia en LevelSensor:")
             return None
 
     def detectar_fallo(self, expected_flow=None):
         """
-        Detecta si hay fuga o bloqueo en las tuberías.
-        :param expected_flow: Caudal esperado en L/min
-        :return: True si hay fallo, False si todo está bien
+        Chequeos mínimos de falla:
+          - last_reading > 105% => sospechoso
         """
         with self.lock:
             if self.last_reading is None:
-                logging.warning("No se ha podido obtener lectura del sensor de flujo.")
+                logging.warning("LevelSensor sin lectura previa.")
                 return True
-            if expected_flow is not None:
-                # Definir tolerancia para detectar anomalías
-                tolerance = self.calibration_params.get('tolerance', 0.2)  # 20% de tolerancia
-                if expected_flow == 0:
-                    # No se espera flujo; si hay flujo significativo, podría ser una fuga
-                    if self.last_reading > 0.5:  # Umbral mínimo para evitar ruido
-                        logging.error("Posible fuga en las tuberías detectada. Flujo detectado cuando no debería haber.")
-                        return True
-                else:
-                    # Se espera flujo; verificar desviaciones
-                    if self.last_reading < expected_flow * (1 - tolerance):
-                        logging.error("Posible bloqueo en las tuberías detectado.")
-                        return True
-                    elif self.last_reading > expected_flow * (1 + tolerance):
-                        logging.error("Posible fuga en las tuberías detectada.")
-                        return True
+            if self.last_reading > 105:
+                logging.error(f"Lectura de nivel sospechosa: {self.last_reading:.2f}%")
+                return True
         return False
 
+
+# -------------------------------------------------------------------------------
+# FlowSensor (FS300A)
+# -------------------------------------------------------------------------------
 class FlowSensor:
     """
-    Sensor de flujo de agua FS300A.
+    Sensor de flujo (FS300A) que cuenta pulsos mediante interrupciones en un pin GPIO.
+    - self.flow_frequency se incrementa en cada pulso (callback).
+    - Se realiza un conteo durante 1 segundo en leer().
+    - La conversión a L/min se hace con un factor 'conversion_factor'.
+
+    Advertencia:
+      - En caudales muy altos, podría dispararse la interrupción con demasiada
+        frecuencia y saturar la CPU en sistemas de baja capacidad.
+      - Se recomienda un hardware o software adicional para "dividir" pulsos
+        si el caudal esperado es muy elevado.
     """
+
     def __init__(self, gpio_pin, calibration_params=None):
         self.gpio_pin = gpio_pin
         self.calibration_params = calibration_params or {}
         self.last_reading = None
-        self.simulation_mode = sys.platform == "win32"
+        self.simulation_mode = (sys.platform == "win32")
+
         self.flow_frequency = 0
+        # Ejemplo: 5.5 pulsos/L => factor = 5.5 => 1 pulso/seg => 1/5.5 L/s => 10.9 L/min
         self.conversion_factor = self.calibration_params.get('factor', 5.5)
-        self.counting_event = threading.Event()
-        self.simulated_flow_rate = 0.0  # Añadido para simular el flujo actual
-        # Implementación de lock para seguridad de hilos
+        self.simulated_flow_rate = 0.0
+
         self.lock = threading.Lock()
 
-        if not self.simulation_mode:
+        if not self.simulation_mode and GPIO is not None:
             GPIO.setup(self.gpio_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
             GPIO.add_event_detect(self.gpio_pin, GPIO.RISING, callback=self._count_pulse)
-            logging.info("Sensor de flujo inicializado.")
+            logging.info("FlowSensor inicializado (FS300A) en modo real.")
         else:
-            logging.info("Sensor de flujo inicializado en modo simulado.")
+            logging.info("FlowSensor en modo simulado.")
 
     def _count_pulse(self, channel):
+        """
+        Callback para la interrupción de RISING en el pin del sensor de flujo.
+        Incrementa el contador de pulsos de forma thread-safe.
+        """
         with self.lock:
             self.flow_frequency += 1
 
     def leer(self, bomba_activa=False, valvula_riego_abierta=False):
         """
-        Lee el caudal actual en litros por minuto.
-        :param bomba_activa: Estado de la bomba (True si está activa)
-        :param valvula_riego_abierta: Estado de la válvula de riego (True si está abierta)
-        :return: Caudal en L/min
+        Retorna el caudal en L/min. En modo real:
+          - Se limpia el contador, se espera 1 segundo, se lee el contador.
+          - flow_rate = (frequency / conversion_factor).
+        En modo simulado:
+          - Ajusta flow_rate según estado de bomba y válvula.
+
+        :param bomba_activa: bool, si la bomba está encendida.
+        :param valvula_riego_abierta: bool, si la válvula de riego está abierta.
+        :return: Caudal en L/min o None si falla/detectar_fallo = True
         """
-        if not self.simulation_mode:
+        if not self.simulation_mode and GPIO is not None:
             try:
-                # Reiniciar contador
                 with self.lock:
                     self.flow_frequency = 0
-                # Esperar durante 1 segundo sin bloquear el hilo principal
+                # Conteo de pulsos durante 1 segundo
                 time.sleep(1)
-                # Obtener frecuencia
                 with self.lock:
                     frequency = self.flow_frequency
-                # Calcular el caudal en L/min
-                flow_rate = (frequency / self.conversion_factor)
+
+                flow_rate = frequency / self.conversion_factor
                 with self.lock:
                     self.last_reading = flow_rate
 
-                logging.debug(f"Caudal medido: {flow_rate:.3f} L/min")
-
-                # Detectar fallos
+                logging.debug(f"FlowSensor => {flow_rate:.3f} L/min")
                 if self.detectar_fallo():
                     return None
-
                 return flow_rate
             except Exception:
-                logging.exception("Error al leer el sensor de flujo:")
+                logging.exception("Error en FlowSensor:")
                 return None
         else:
-            # Modo simulado con lógica mejorada
+            # Modo simulado
             with self.lock:
+                # Ajuste de caudal según si la bomba y la válvula están activas
                 if bomba_activa and valvula_riego_abierta:
-                    # Incrementar gradualmente el flujo hasta un máximo
-                    max_flow_rate = 60.0  # Máximo caudal en L/min
-                    increment = 5.0        # Incremento por lectura
-                    self.simulated_flow_rate = min(self.simulated_flow_rate + increment, max_flow_rate)
+                    max_flow = 60.0  # un tope arbitrario en L/min para simulación
+                    inc = 5.0
+                    self.simulated_flow_rate = min(self.simulated_flow_rate + inc, max_flow)
                 else:
-                    # Decrementar gradualmente el flujo hasta llegar a cero
-                    decrement = 5.0  # Decremento por lectura
-                    self.simulated_flow_rate = max(self.simulated_flow_rate - decrement, 0.0)
+                    dec = 5.0
+                    self.simulated_flow_rate = max(self.simulated_flow_rate - dec, 0.0)
 
                 flow_rate = self.simulated_flow_rate
                 self.last_reading = flow_rate
 
-            logging.debug(f"Caudal simulado: {flow_rate:.3f} L/min")
+            logging.debug(f"FlowSensor(sim) => {flow_rate:.3f} L/min")
+            if self.detectar_fallo():
+                return None
             return flow_rate
 
     def detectar_fallo(self, expected_flow=None):
         """
-        Detecta si hay fuga o bloqueo en las tuberías.
-        :param expected_flow: Caudal esperado en L/min
-        :return: True si hay fallo, False si todo está bien
+        Detecta anomalías (fuga u obstrucción) si se pasa un expected_flow,
+        además de verificar caudales excesivamente altos (p.e. > 200 L/min => fallo).
+
+        :param expected_flow: Caudal esperado (L/min). Si None, se omite esta parte.
         """
         with self.lock:
             if self.last_reading is None:
-                logging.warning("No se ha podido obtener lectura del sensor de flujo.")
+                logging.warning("FlowSensor sin lectura previa.")
                 return True
+
+            # Chequeo básico: si el caudal > 200 L/min, se considera muy alto => posible sensor dañado
+            if self.last_reading > 200:
+                logging.error(f"FlowSensor lectura sospechosamente alta: {self.last_reading:.2f} L/min")
+                return True
+
             if expected_flow is not None:
-                # Definir tolerancia para detectar anomalías
-                tolerance = self.calibration_params.get('tolerance', 0.2)  # 20% de tolerancia
-                minimal_flow_threshold = self.calibration_params.get('minimal_flow_threshold', 0.5)  # Umbral mínimo para considerar flujo significativo
+                tol = self.calibration_params.get('tolerance', 0.2)
+                min_thr = self.calibration_params.get('minimal_flow_threshold', 0.5)
 
                 if expected_flow == 0:
-                    # No se espera flujo; si hay flujo significativo, podría ser una fuga
-                    if self.last_reading > minimal_flow_threshold:
-                        logging.error("Posible fuga en las tuberías detectada. Flujo detectado cuando no debería haber.")
+                    # No se espera flujo => si lo hay, podría ser fuga
+                    if self.last_reading > min_thr:
+                        logging.error("Fuga detectada: flujo cuando no debería haber.")
                         return True
                 else:
-                    # Se espera flujo; verificar desviaciones
-                    if self.last_reading < expected_flow * (1 - tolerance):
-                        logging.error("Posible bloqueo en las tuberías detectado.")
+                    # Se verifica si está por debajo o por encima del flujo esperado (± tolerancia)
+                    if self.last_reading < expected_flow * (1 - tol):
+                        logging.error("Posible bloqueo: flujo < esperado.")
                         return True
-                    elif self.last_reading > expected_flow * (1 + tolerance):
-                        logging.error("Posible fuga en las tuberías detectada.")
+                    elif self.last_reading > expected_flow * (1 + tol):
+                        logging.error("Posible fuga: flujo > esperado.")
                         return True
+
         return False

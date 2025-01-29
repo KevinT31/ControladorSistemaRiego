@@ -12,146 +12,202 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 def generate_synthetic_data(num_samples=4320):
     """
     Genera datos sintéticos realistas para entrenar el modelo de Machine Learning.
-    Genera datos para 90 días, tomando una muestra cada 30 minutos.
+    - Por defecto: 90 días, con 2 muestras/hora => 48 muestras/día => 4320 totales.
+    - Cada muestra corresponde aproximadamente a 30 minutos de datos.
 
-    :param num_samples: Número de muestras a generar (90 días * 24 horas * 2 muestras por hora). 
+    Param:
+    -------
+    num_samples : int
+        Número total de muestras a generar. Por defecto 4320 (90 días * 48).
     """
     data = []
+    # Fecha inicial ~ hace 90 días
+    start_date = datetime.now() - timedelta(days=90)
+    current_time = start_date
 
-    # Fecha inicial (hace 90 días) 
-    start_date = datetime.now() - timedelta(days=90) 
-    timestamp = start_date
-
-    # Variables para mantener coherencia temporal
-    last_humidity = np.random.uniform(30, 70)
-    last_temperature = np.random.uniform(15, 25)
-    last_water_level = np.random.uniform(50, 100)
-    last_ce = np.random.uniform(1.0, 2.5)
+    # Variables iniciales (semi-random) para simular evolución
+    last_humidity = np.random.uniform(30, 70)       # % de humedad del suelo
+    last_temperature = np.random.uniform(15, 25)    # °C
     last_ph = np.random.uniform(5.5, 7.5)
-    last_flow_rate = 0.0
+    last_ce = np.random.uniform(1.0, 2.5)           # Conductividad eléctrica
+    last_water_level = np.random.uniform(40, 80)    # 0-100, representando %
+    last_flow_rate = 0.0                            # L/min
+    # Nutrientes N, P, K en ppm (arbitrario)
+    last_n = np.random.uniform(10, 50)
+    last_p = np.random.uniform(5, 30)
+    last_k = np.random.uniform(10, 40)
 
     for _ in range(num_samples):
-        # Incrementar el timestamp
-        timestamp += timedelta(minutes=30)
+        # Incrementar timestamp en 30 min
+        current_time += timedelta(minutes=30)
 
-        # Determinar la estación del año basada en la fecha
-        month = timestamp.month
+        # Determinar estación según mes
+        month = current_time.month
         if month in [12, 1, 2]:
             season = 'summer'
-            temp_base = 30
-            temp_variation = 5
+            base_temp = 27
+            temp_var = 5
         elif month in [3, 4, 5]:
             season = 'autumn'
-            temp_base = 20
-            temp_variation = 5
+            base_temp = 20
+            temp_var = 4
         elif month in [6, 7, 8]:
             season = 'winter'
-            temp_base = 10
-            temp_variation = 5
+            base_temp = 12
+            temp_var = 3
         else:
             season = 'spring'
-            temp_base = 20
-            temp_variation = 5
+            base_temp = 22
+            temp_var = 4
 
-        # Generar temperatura con pequeñas variaciones
-        temperature = temp_base + np.random.normal(0, temp_variation)
+        # Simular temperatura actual
+        temperature = base_temp + np.random.normal(0, temp_var)
         temperature = np.clip(temperature, 5, 40)
-        last_temperature = temperature
 
-        # Generar humedad relativa del aire inversamente proporcional a la temperatura
-        humidity_air = 100 - temperature + np.random.normal(0, 5)
-        humidity_air = np.clip(humidity_air, 20, 80)
-
-        # Generar humedad del suelo, que aumenta si hubo riego
+        # La humedad del suelo depende del riego y la evapotranspiración
+        # Si hubo riego recientemente (flow_rate > 0), sube la humedad
+        # Sino, va bajando lentamente
         if last_flow_rate > 0:
-            # Simular aumento de humedad del suelo después de riego
-            humidity = last_humidity + np.random.uniform(5, 15)
+            humidity = last_humidity + np.random.uniform(4, 10)
         else:
-            # Disminución natural de la humedad del suelo
             humidity = last_humidity - np.random.uniform(0, 2)
-        humidity = np.clip(humidity, 10, 90)
-        last_humidity = humidity
+        humidity = np.clip(humidity, 5, 95)
 
-        # Generar pH con pequeñas variaciones alrededor de un valor central
+        # pH con ligeras variaciones
         ph = last_ph + np.random.normal(0, 0.05)
-        ph = np.clip(ph, 5.0, 8.0)
-        last_ph = ph
+        ph = np.clip(ph, 4.5, 8.5)
 
-        # Generar CE con pequeñas variaciones, aumenta ligeramente si se inyectó fertilizante
-        ce = last_ce + (0.1 if np.random.rand() < 0.3 else 0) + np.random.normal(0, 0.05)
-        ce = np.clip(ce, 0.5, 3.0)
-        last_ce = ce
+        # CE varía con fertilizaciones y drenajes
+        ce = last_ce + np.random.normal(0, 0.05)
+        ce = np.clip(ce, 0.5, 3.5)
 
-        # Generar nivel de agua del tanque
-        if last_flow_rate > 0:
-            # Disminuir nivel de agua si hubo riego
-            water_level = last_water_level - np.random.uniform(1, 3)
-        else:
-            # Recuperación lenta del nivel (por ejemplo, por suministro alternativo)
-            water_level = last_water_level + (2 if np.random.rand() < 0.1 else 0)
-        water_level = np.clip(water_level, 0, 100)
-        last_water_level = water_level
+        # Nutrientes N, P, K (aumentan si se inyecta fertilizante, sino bajan)
+        n = last_n
+        p = last_p
+        k = last_k
 
-        # Decisiones basadas en reglas
+        # Lógica de acciones (bomba, riego, fertilizante, etc.)
         activar_bomba = False
         abrir_valvula_riego = False
         inyectar_fertilizante = False
         abrir_valvula_suministro = False
+        abrir_juego_desague = False
+
+        # Por defecto, no hay fertilizante ni agua
         porcentaje_fertilizante = 0.0
         cantidad_agua = 0.0
         flow_rate = 0.0
 
-        # Lógica de riego
-        if humidity < 40 or temperature > 30:
+        # Ajustar water_level
+        # Si la bomba está prendida y se riega, baja el nivel
+        # Si se abre el suministro, sube el nivel
+        water_level = last_water_level
+
+        # REGLAS de “experto manual” (simplificadas):
+        # 1) Si humidity < 35 o temp > 30 => regar
+        # 2) Si CE < 0.9 => inyectar fertilizante
+        # 3) Si water_level < 20 => abrir suminstro
+        # 4) Si water_level > 90 => abrir desagüe
+        # 5) flow_rate simulado en [20..60] L/min si se riega
+
+        # Regla 1: riego
+        if humidity < 35 or temperature > 30:
             activar_bomba = True
             abrir_valvula_riego = True
-            cantidad_agua = np.random.uniform(10, 30)
+            cantidad_agua = np.random.uniform(10, 25)
             flow_rate = np.random.uniform(20, 60)
-        else:
-            flow_rate = 0.0
 
-        # Lógica de fertilización
-        if ce < 1.0:
+        # Regla 2: fertilizar si CE baja
+        if ce < 0.9:
             inyectar_fertilizante = True
             porcentaje_fertilizante = np.random.uniform(1, 5)
 
-        # Lógica de suministro alternativo
+        # Ajustar N, P, K si se fertiliza
+        if inyectar_fertilizante:
+            # Incrementar N, P, K en un rango
+            dn = np.random.uniform(5, 12)
+            dp = np.random.uniform(2, 8)
+            dk = np.random.uniform(3, 10)
+            n = last_n + dn
+            p = last_p + dp
+            k = last_k + dk
+        else:
+            # Disminuyen un poco con el tiempo
+            n = last_n - np.random.uniform(0, 1)
+            p = last_p - np.random.uniform(0, 0.5)
+            k = last_k - np.random.uniform(0, 0.5)
+        n = np.clip(n, 0, 150)
+        p = np.clip(p, 0, 80)
+        k = np.clip(k, 0, 120)
+
+        # Regla 3: Suministro
         if water_level < 20:
             abrir_valvula_suministro = True
-            water_level += np.random.uniform(10, 30)  # Simular llenado del tanque
-            water_level = np.clip(water_level, 0, 100)
+            # Simular relleno
+            water_level += np.random.uniform(5, 15)
 
-        # Actualizar last_flow_rate
+        # Regla 4: Desagüe
+        if water_level > 90:
+            abrir_juego_desague = True
+            # Simular drenaje
+            water_level -= np.random.uniform(5, 15)
+
+        # Ajustar water_level si bomba y riego => se reduce
+        if activar_bomba and abrir_valvula_riego:
+            # Q se retira del tanque
+            water_level -= np.random.uniform(1, 3)
+
+        water_level = np.clip(water_level, 0, 100)
+
+        # Recalcular CE (sube un poco si fertilizas, baja si drenas)
+        if inyectar_fertilizante:
+            ce += np.random.uniform(0.1, 0.4)
+        if abrir_juego_desague:
+            ce -= np.random.uniform(0.1, 0.3)
+        ce = np.clip(ce, 0.5, 3.5)
+
+        # Actualizar states para la siguiente iteración
+        last_humidity = humidity
+        last_temperature = temperature
+        last_ph = ph
+        last_ce = ce
+        last_water_level = water_level
         last_flow_rate = flow_rate
+        last_n, last_p, last_k = n, p, k
 
-        # Crear el registro de datos
+        # Construir registro
         sample = {
-            'timestamp': timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+            'timestamp': current_time.strftime('%Y-%m-%d %H:%M:%S'),
             'humidity': round(humidity, 1),
             'temperature': round(temperature, 1),
             'ph': round(ph, 2),
             'ce': round(ce, 2),
+            'N': round(n, 2),
+            'P': round(p, 2),
+            'K': round(k, 2),
             'water_level': round(water_level, 1),
             'flow_rate': round(flow_rate, 1),
             'season': season,
+
             'activar_bomba': activar_bomba,
             'abrir_valvula_riego': abrir_valvula_riego,
             'inyectar_fertilizante': inyectar_fertilizante,
             'abrir_valvula_suministro': abrir_valvula_suministro,
+            'abrir_juego_desague': abrir_juego_desague,
+
             'porcentaje_fertilizante': round(porcentaje_fertilizante, 1),
             'cantidad_agua': round(cantidad_agua, 1)
         }
-
         data.append(sample)
 
     df = pd.DataFrame(data)
 
-    # Crear el directorio 'data' si no existe
+    # Crear carpeta 'data' si no existe
     os.makedirs('data', exist_ok=True)
 
-    # Guardar en CSV
-    df.to_csv('data/decision_data.csv', index=False)
-    logging.info("Datos sintéticos generados y guardados en 'data/decision_data.csv'.")
+    output_path = 'data/decision_data.csv'
+    df.to_csv(output_path, index=False)
+    logging.info(f"Datos sintéticos generados y guardados en '{output_path}'. Filas: {len(df)}")
 
 if __name__ == "__main__":
-    generate_synthetic_data()
+    generate_synthetic_data(num_samples=4320)
