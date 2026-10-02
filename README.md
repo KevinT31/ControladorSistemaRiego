@@ -99,3 +99,7 @@ Cloud synchronization and model-training modules complement the local control lo
 ## Portfolio Notes
 
 This project demonstrates Python software architecture for an IoT/automation scenario, including sensor integration, control logic, machine learning, cloud integration and testing.
+
+## Related Project
+
+A smaller related implementation is available in [`Siemens`](https://github.com/KevinT31/Siemens). This repository contains the broader variant, including cloud synchronization, cloud-oriented training and synthetic-data generation.
