@@ -1,105 +1,103 @@
+<div align="center">
+
 # Intelligent Irrigation Controller
 
-Modular smart-irrigation system with sensor processing, machine learning, cloud synchronization and actuator control.
+### IoT · Machine Learning · Automation · Cloud Integration
+
+</div>
+
+---
 
 ## Overview
 
-This repository contains a Python-based irrigation controller designed around a modular architecture. The system coordinates sensors, signal conditioning, decision logic, actuators and model-training utilities through a central controller.
+Python-based smart-irrigation system that coordinates **sensor acquisition, signal conditioning, decision logic, actuator control, model training and cloud-oriented utilities**.
 
-The project includes both local machine-learning workflows and cloud-oriented modules, together with synthetic-data generation and tests for core components.
-
-## Main Features
-
-- Environmental and hydraulic sensor acquisition
-- Signal conditioning and validation
-- Automatic irrigation control
-- Machine-learning-assisted decision engine
-- Rule-based fallback decisions
-- Pump and valve actuator control
-- Local and cloud-oriented model training
-- Cloud synchronization utilities
-- Synthetic data generation
-- GUI and test modules
-
-## Tech Stack
-
-- Python
-- pandas / NumPy
-- scikit-learn
-- XGBoost
-- Google Cloud libraries
-- Flask
-- Modbus
-- Adafruit sensor libraries
-- Matplotlib
-
-## Project Structure
-
-```text
-src/
-├── main.py                    # Application entry point
-├── controller.py              # Main system orchestration
-├── sensors.py                 # Sensor acquisition
-├── signal_conditioning.py     # Signal preprocessing
-├── decision_engine.py         # Decision logic
-├── actuators.py               # Pump/valve control
-├── model_training.py          # Local model training
-├── cloud_model_training.py    # Cloud-oriented training workflow
-├── cloud_sync.py              # Cloud synchronization
-├── generate_synthetic_data.py
-├── gui.py
-└── tests/                     # Additional tests
-```
-
-## Getting Started
-
-### Requirements
-
-- Python 3
-- A virtual environment is recommended
-
-### Installation
-
-```bash
-git clone https://github.com/KevinT31/ControladorSistemaRiego.git
-cd ControladorSistemaRiego
-python -m venv .venv
-```
-
-Activate the environment and install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
-
-Run the application:
-
-```bash
-python src/main.py
-```
+This is the broader of two related irrigation repositories in this profile. The compact prototype is available in [Siemens](https://github.com/KevinT31/Siemens).
 
 ## Architecture
 
-At a high level, the project follows this flow:
+~~~mermaid
+flowchart LR
+    Sensors[Sensors] --> Conditioning[Signal Conditioning]
+    Conditioning --> Decision[Decision Engine]
+    Decision --> Controller[Central Controller]
+    Controller --> Actuators[Pump / Valves]
 
-```text
-Sensors
-   ↓
-Signal conditioning
-   ↓
-Decision engine
-   ↓
-Central controller
-   ↓
-Actuators
-```
+    Training[Model Training] --> Decision
+    Synthetic[Synthetic Data] --> Training
+    Cloud[Cloud Sync / Cloud Training] --> Decision
+~~~
 
-Cloud synchronization and model-training modules complement the local control loop.
+## Main Components
 
-## Portfolio Notes
+- environmental/hydraulic sensor abstraction
+- signal conditioning
+- central controller
+- machine-learning-assisted decisions
+- rule-based fallback logic
+- pump/valve actuator control
+- local model training
+- cloud-oriented training utilities
+- cloud synchronization
+- synthetic data generation
+- GUI
+- test modules
 
-This project demonstrates Python software architecture for an IoT/automation scenario, including sensor integration, control logic, machine learning, cloud integration and testing.
+## Tech Stack
 
-## Related Project
+Python · pandas · NumPy · scikit-learn · XGBoost · Flask · Google Cloud libraries · Modbus · Adafruit libraries · Matplotlib
 
-A smaller related implementation is available in [`Siemens`](https://github.com/KevinT31/Siemens). This repository contains the broader variant, including cloud synchronization, cloud-oriented training and synthetic-data generation.
+## Structure
+
+~~~text
+src/
+├── main.py
+├── controller.py
+├── sensors.py
+├── signal_conditioning.py
+├── decision_engine.py
+├── actuators.py
+├── model_training.py
+├── cloud_model_training.py
+├── cloud_sync.py
+├── generate_synthetic_data.py
+├── gui.py
+└── tests/
+~~~
+
+## Run Locally
+
+~~~bash
+git clone https://github.com/KevinT31/ControladorSistemaRiego.git
+cd ControladorSistemaRiego
+
+python -m venv .venv
+# activate the virtual environment
+
+pip install -r requirements.txt
+python src/main.py
+~~~
+
+## Engineering Notes
+
+### Fallback control
+
+Irrigation logic should not depend exclusively on a serialized ML model. The broader architecture preserves deterministic/rule-based decision paths.
+
+### Training vs runtime
+
+Training utilities are separated from the runtime controller loop so experimentation does not become a runtime dependency.
+
+### Synthetic data
+
+Synthetic-data generation is explicit and should be understood as engineering/testing support rather than real field telemetry.
+
+## Scope
+
+This repository is an engineering prototype for IoT/automation architecture. It should not be interpreted as a certified agricultural control system or a production hardware deployment.
+
+---
+
+### What this project demonstrates
+
+**Python modularity · IoT control loops · ML-assisted automation · actuator/sensor integration · cloud-oriented workflows**
